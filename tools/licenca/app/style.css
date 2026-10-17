@@ -1,0 +1,46 @@
+:root {
+    color-scheme: light;
+    font-family: "Segoe UI", Arial, sans-serif;
+    color: #17233a;
+    background: #f4f7fc;
+}
+
+* { box-sizing: border-box; }
+
+body { margin: 0; min-width: 600px; }
+
+.app { width: min(680px, 100%); margin: 0 auto; padding: 32px 26px 22px; }
+
+.cabecalho { display: flex; align-items: center; gap: 16px; margin-bottom: 24px; }
+.logo { width: 54px; height: 54px; flex: 0 0 54px; display: grid; place-items: center; border-radius: 16px; background: linear-gradient(145deg,#3b82f6,#1d4ed8); color: white; font-size: 17px; font-weight: 800; box-shadow: 0 8px 20px #2563eb33; }
+.eyebrow { color: #2563eb; font-size: 10px; font-weight: 800; letter-spacing: .12em; }
+h1 { margin: 3px 0 4px; font-size: 23px; letter-spacing: -.03em; }
+.cabecalho p, .resultado p { margin: 0; color: #71809a; font-size: 13px; }
+
+.cartao { padding: 21px; margin-bottom: 16px; background: #fff; border: 1px solid #e4eaf3; border-radius: 14px; box-shadow: 0 7px 22px #17233a08; }
+.campo { margin-bottom: 16px; }
+label { display: block; margin-bottom: 7px; color: #34425a; font-size: 12px; font-weight: 700; }
+input, select, textarea { width: 100%; border: 1px solid #d8e0ec; border-radius: 9px; background: #fff; color: #17233a; font: inherit; outline: none; }
+input, select { height: 42px; padding: 0 12px; font-size: 13px; }
+textarea { padding: 11px; resize: vertical; font: 11px/1.5 Consolas, monospace; overflow-wrap: anywhere; }
+input:focus, select:focus, textarea:focus { border-color: #3b82f6; box-shadow: 0 0 0 3px #3b82f61c; }
+small { display: block; margin-top: 6px; color: #8b98ad; font-size: 11px; }
+.botao-primario, .botao-secundario { height: 42px; padding: 0 15px; border-radius: 9px; font-size: 12px; font-weight: 700; cursor: pointer; transition: .15s ease; }
+.botao-primario { width: 100%; border: 0; background: #2563eb; color: #fff; box-shadow: 0 5px 12px #2563eb26; }
+.botao-primario:hover { background: #1d4ed8; }
+.botao-primario:disabled { opacity: .65; cursor: wait; }
+.botao-secundario { border: 1px solid #d8e0ec; background: #fff; color: #34425a; }
+.botao-secundario:hover:not(:disabled) { border-color: #93b4f5; background: #f7faff; }
+.botao-secundario:disabled { color: #a9b2c0; background: #f7f8fa; cursor: not-allowed; }
+.mensagem { min-height: 0; margin-top: 0; color: #b42318; font-size: 12px; }
+.mensagem:not(:empty) { margin-top: 12px; }
+.mensagem.sucesso { color: #15803d; }
+.resultado-topo { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+h2 { margin: 0 0 5px; font-size: 15px; }
+.selo { flex: 0 0 auto; padding: 5px 9px; border-radius: 20px; background: #f1f5f9; color: #64748b; font-size: 10px; font-weight: 700; }
+.selo.ativo { background: #dcfce7; color: #15803d; }
+.acoes { display: flex; justify-content: flex-end; gap: 9px; margin-top: 11px; }
+.aviso { margin-bottom: 16px; padding: 12px 14px; border: 1px solid #fed7aa; border-radius: 10px; background: #fff7ed; color: #9a3412; font-size: 12px; line-height: 1.7; }
+.aviso[hidden], [hidden] { display: none !important; }
+.aviso code { font-size: 11px; }
+footer { padding: 4px; color: #94a3b8; text-align: center; font-size: 10px; }

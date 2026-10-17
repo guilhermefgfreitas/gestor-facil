@@ -1,0 +1,10 @@
+node_modules/
+dist/
+**/dist/
+release/
+*.db
+*.db-*
+*.bak*
+*.rar
+/backup-*/
+/licenses/license-private.pem

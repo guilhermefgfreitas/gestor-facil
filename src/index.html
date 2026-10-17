@@ -1,0 +1,283 @@
+<!-- Estrutura estática da janela; renderer.js preenche o conteúdo dinâmico após o login. -->
+<!DOCTYPE html>
+<html lang="pt-BR">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Gestor Fácil</title>
+
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+    <div class="app">
+
+        <!-- Navegação dos módulos; renderer.js controla acesso e item selecionado. -->
+        <aside class="sidebar">
+
+            <div class="logo">
+                <div class="logo-icon">GF</div>
+
+                <div>
+                    <h2>Gestor Fácil</h2>
+                    <span>Sistema de Gestão</span>
+                </div>
+            </div>
+
+            <nav class="menu">
+
+                <button class="menu-item" id="menu-inicio">
+                    <span>🏠</span>
+                    Início
+                </button>
+
+                <button class="menu-item" id="menu-produtos">
+                    <span>📦</span>
+                    Produtos
+                </button>
+
+                <button class="menu-item" id="menu-clientes">
+                    <span>👥</span>
+                    Clientes
+                </button>
+
+                <button class="menu-item" id="menu-vendas">
+                    <span>🛒</span>
+                    Vendas
+                </button>
+                
+                <button class="menu-item" id="menu-os">
+                    <span>🛠️</span>
+                    Ordens de Serviço
+                </button>
+
+                <button class="menu-item" id="menu-garantias">
+                    <span>🛡️</span>
+                    Garantias
+                </button>
+
+                <button class="menu-item" id="menu-estoque">
+                    <span>📋</span>
+                    Estoque
+                </button>
+
+                <button class="menu-item" id="menu-relatorios">
+                    <span>📊</span>
+                    Relatórios
+                </button>
+
+                <!-- Itens de administração começam ocultos e são liberados por perfil. -->
+                <button class="menu-item" id="menu-usuarios" style="display:none;">
+                    <span>👤</span>
+                    Usuários
+                </button>
+
+                <button class="menu-item" id="menu-auditoria" style="display:none;">
+                    <span>🧾</span>
+                    Auditoria
+                </button>
+
+            </nav>
+
+            <div class="sidebar-footer">
+                <span>Gestor Fácil</span>
+                <small>Versão 1.0.0</small>
+            </div>
+
+        </aside>
+
+
+        <!-- ÁREA PRINCIPAL -->
+        <main class="main">
+
+            <!-- Cabeçalho global, notificações de estoque e usuário conectado. -->
+            <header class="topbar">
+
+                <div>
+                    <h1>Dashboard</h1>
+                    <p>Visão geral do seu negócio</p>
+                </div>
+
+                <div class="topbar-acoes">
+
+                    <button type="button" class="botao-atualizacoes" id="botao-atualizacoes" style="display:none;" title="Verificar se há uma nova versão">
+                        <span aria-hidden="true">↻</span>
+                        <span id="texto-atualizacoes">Verificar atualizações</span>
+                    </button>
+
+                    <div class="notificacoes-wrap" id="notificacoes-wrap">
+                        <button type="button" class="botao-notificacoes" id="botao-notificacoes" title="Notificações" aria-label="Notificações">
+                            <span class="icone-sino">🔔</span>
+                            <span class="badge-notificacoes" id="badge-notificacoes" style="display:none;">0</span>
+                        </button>
+                        <div class="painel-notificacoes" id="painel-notificacoes" style="display:none;">
+                            <div class="notificacoes-cabecalho">
+                                <div>
+                                    <strong>Notificações</strong>
+                                    <small id="notificacoes-resumo">Verificando estoque...</small>
+                                </div>
+                                <button type="button" id="fechar-notificacoes" class="notificacoes-fechar" aria-label="Fechar">×</button>
+                            </div>
+                            <div id="lista-notificacoes"></div>
+                        </div>
+                    </div>
+
+                    <div class="user">
+
+                    <div class="user-icon">
+                        G
+                    </div>
+
+                    <div>
+                        <strong id="usuario-topo-nome">Administrador</strong>
+                        <small id="usuario-topo-perfil">Usuário principal</small>
+                    </div>
+
+                </div>
+
+            </header>
+
+
+            <!-- Área onde renderer.js desenha dashboard e páginas dos módulos. -->
+            <section class="content" id="conteudo">
+
+                <div class="cards">
+
+                    <div class="card">
+
+                        <div class="card-icon green">
+                            💰
+                        </div>
+
+                        <div>
+                            <span>Vendas hoje</span>
+                            <h2>R$ 0,00</h2>
+                        </div>
+
+                    </div>
+
+
+                    <div class="card">
+
+                        <div class="card-icon blue">
+                            📦
+                        </div>
+
+                        <div>
+                            <span>Produtos</span>
+                            <h2>0</h2>
+                        </div>
+
+                    </div>
+
+
+                    <div class="card">
+
+                        <div class="card-icon orange">
+                            👥
+                        </div>
+
+                        <div>
+                            <span>Clientes</span>
+                            <h2>0</h2>
+                        </div>
+
+                    </div>
+
+
+                    <div class="card">
+
+                        <div class="card-icon purple">
+                            📋
+                        </div>
+
+                        <div>
+                            <span>Estoque</span>
+                            <h2>0</h2>
+                        </div>
+
+                    </div>
+
+                </div>
+
+
+                <div class="dashboard-grid">
+
+                    <div class="panel">
+
+                        <div class="panel-header">
+
+                            <div>
+                                <h3>Vendas recentes</h3>
+                                <span>Últimas vendas realizadas</span>
+                            </div>
+
+                            <button class="button">
+                                + Nova venda
+                            </button>
+
+                        </div>
+
+                        <div class="empty">
+
+                            <div class="empty-icon">
+                                🛒
+                            </div>
+
+                            <h3>Nenhuma venda registrada</h3>
+
+                            <p>
+                                Quando você realizar uma venda,
+                                ela aparecerá aqui.
+                            </p>
+
+                        </div>
+
+                    </div>
+
+
+                    <div class="panel">
+
+                        <div class="panel-header">
+
+                            <div>
+                                <h3>Estoque baixo</h3>
+                                <span>Produtos que precisam de reposição</span>
+                            </div>
+
+                        </div>
+
+                        <div class="empty">
+
+                            <div class="empty-icon">
+                                📦
+                            </div>
+
+                            <h3>Estoque vazio</h3>
+
+                            <p>
+                                Cadastre seus produtos
+                                para começar.
+                            </p>
+
+                        </div>
+
+                    </div>
+
+                </div>
+
+            </section>
+
+        </main>
+
+    </div>
+
+
+    <script src="renderer.js"></script>
+
+</body>
+
+</html>

@@ -1,0 +1,28 @@
+{
+  "name": "gestor-facil-gerador-licencas",
+  "version": "1.0.0",
+  "description": "Gerador local de licenças do Gestor Fácil",
+  "main": "main.cjs",
+  "devDependencies": {
+    "electron": "^44.5.1"
+  },
+  "build": {
+    "appId": "br.com.gestorfacil.licenciador",
+    "productName": "Gerador de Licenças - Gestor Fácil",
+    "directories": {
+      "output": "../../dist/licenciador"
+    },
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "renderer.js",
+      "index.html",
+      "style.css",
+      "license-core.cjs"
+    ],
+    "win": {
+      "target": "portable",
+      "artifactName": "Gerador-de-Licencas-${version}.exe"
+    }
+  }
+}

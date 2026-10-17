@@ -1,0 +1,54 @@
+{
+  "name": "gestor-facil",
+  "version": "1.0.0",
+  "description": "Sistema de gestão para pequenos negócios",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis --config electron-builder.config.cjs",
+    "publish:github": "electron-builder --win nsis --config electron-builder.config.cjs --publish always",
+    "dist:licenciador": "electron-builder --projectDir tools/licenca/app --win portable",
+    "licenca:preparar": "node tools/licenca/preparar-chaves.cjs",
+    "licenca:gerar": "node tools/licenca/gerar-licenca.cjs"
+  },
+  "devDependencies": {
+    "electron": "^44.5.1",
+    "electron-builder": "^26.15.3"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "electron-updater": "^6.8.9"
+  },
+  "build": {
+    "appId": "br.com.gestorfacil.app",
+    "productName": "Gestor Fácil",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "licenciamento.js",
+      "src/**/*",
+      "database/**/*.js",
+      "licenses/license-public.pem",
+      "package.json",
+      "!**/*.bak*",
+      "!**/*.rar",
+      "!**/gestor-facil.db"
+    ],
+    "asarUnpack": [
+      "node_modules/better-sqlite3/**/*"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}
