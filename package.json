@@ -1,12 +1,12 @@
 {
   "name": "gestor-facil",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Sistema de gestão para pequenos negócios",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder --win nsis --config electron-builder.config.cjs",
-    "publish:github": "electron-builder --win nsis --config electron-builder.config.cjs --publish always",
+    "dist": "electron-builder --win nsis --config electron-builder.config.cjs --publish never",
+    "publish:github": "npm run dist",
     "dist:licenciador": "electron-builder --projectDir tools/licenca/app --win portable",
     "licenca:preparar": "node tools/licenca/preparar-chaves.cjs",
     "licenca:gerar": "node tools/licenca/gerar-licenca.cjs"

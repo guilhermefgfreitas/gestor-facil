@@ -34,8 +34,18 @@ jobs:
             throw "A tag $env:GITHUB_REF_NAME precisa corresponder à versão v$version do package.json."
           }
 
-      - name: Gerar instalador e publicar no GitHub Releases
-        run: npm run publish:github
+      - name: Gerar instalador sem publicar em paralelo
+        run: npm run dist
+
+      - name: Publicar todos os arquivos em uma única Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Gestor Fácil ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest.yml
         env:
-          GH_REPOSITORY: ${{ github.repository }}
-          GH_TOKEN: ${{ secrets.RELEASE_GH_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
