@@ -10,6 +10,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 // API pública mínima consumida por src/renderer.js.
 contextBridge.exposeInMainWorld('api', {
 
+    obterVersaoAplicativo: () => ipcRenderer.invoke('obter-versao-aplicativo'),
+
     obterEstadoLicenca: () => ipcRenderer.invoke('obter-estado-licenca'),
 
     obterEstadoInicializacao: () => ipcRenderer.invoke('obter-estado-inicializacao'),

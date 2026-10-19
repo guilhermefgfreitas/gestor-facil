@@ -597,6 +597,7 @@ app.on('browser-window-created', (_event, janela) => {
 
 
 ipcMain.handle('obter-estado-licenca', () => licenciamento.obterEstadoLicenca());
+ipcMain.handle('obter-versao-aplicativo', () => app.getVersion());
 
 ipcMain.handle('obter-estado-inicializacao', async () => {
     try {
