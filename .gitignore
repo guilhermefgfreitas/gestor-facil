@@ -7,4 +7,6 @@ release/
 *.bak*
 *.rar
 /backup-*/
+/build/firebird/*.exe
 /licenses/license-private.pem
+/licenses/license-private*.pem

@@ -70,6 +70,9 @@ function formatarDataHoraLocal(valor) {
 */
 
 let usuarioLogado = null;
+let intervaloSincronizacaoDados = null;
+let revisaoDadosCompartilhados = null;
+let verificandoRevisaoDados = false;
 
 
 
@@ -79,6 +82,92 @@ function usuarioPode(modulo, acao = 'consultar') {
     if (usuarioLogado.perfil === 'administrador') return true;
     const p = (usuarioLogado.permissoes || []).find(item => item.modulo === modulo);
     return Number(p?.[acao] || 0) === 1;
+}
+
+// Atualiza listas abertas quando outra estação grava no banco compartilhado.
+async function atualizarTelaListaCompartilhada() {
+    if (!usuarioLogado) return false;
+    const conteudoAtual = document.getElementById('conteudo');
+    if (!conteudoAtual || conteudoAtual.querySelector('form')) return false;
+    if (document.querySelector('.modal-overlay-gestor, #modal-seguranca-gestor, .vendas-modal-overlay')) return false;
+
+    const ativo = document.querySelector('.menu-item.active')?.id;
+    const campoFocado = document.activeElement;
+    if (campoFocado && conteudoAtual.contains(campoFocado) && /^(INPUT|SELECT|TEXTAREA)$/.test(campoFocado.tagName)) return false;
+
+    const paginas = {
+        'menu-inicio': ['dash-vendas-recentes', mostrarInicio],
+        'menu-produtos': ['lista-produtos', mostrarProdutos],
+        'menu-clientes': ['lista-clientes', mostrarClientes],
+        'menu-os': ['lista-os', mostrarOrdensServico],
+        'menu-garantias': ['lista-garantias', mostrarGarantias],
+        'menu-estoque': document.getElementById('lista-historico-estoque')
+            ? ['lista-historico-estoque', mostrarHistoricoEstoque]
+            : ['lista-estoque', mostrarEstoque],
+        'menu-relatorios': ['relatorio-total-vendas', mostrarRelatorios],
+        'menu-usuarios': ['tabela-usuarios', mostrarUsuarios],
+        'menu-auditoria': ['tabela-auditoria', mostrarAuditoria]
+    };
+
+    // A tela de nova venda mantém carrinho e cliente selecionado só na memória.
+    // Atualizar ali apagaria a venda em andamento; o histórico pode ser recarregado.
+    if (ativo === 'menu-vendas') {
+        if (!document.getElementById('historico-vendas-lista')) return false;
+        paginas[ativo] = ['historico-vendas-lista', mostrarHistoricoVendas];
+    }
+
+    const pagina = paginas[ativo];
+    if (!pagina || !document.getElementById(pagina[0])) return false;
+
+    const posicao = window.scrollY;
+    const valores = new Map(
+        [...conteudoAtual.querySelectorAll('input[id], select[id], textarea[id]')]
+            .map(campo => [campo.id, campo.type === 'checkbox' ? campo.checked : campo.value])
+    );
+    await pagina[1]();
+    for (const [id, valor] of valores) {
+        const campo = document.getElementById(id);
+        if (!campo) continue;
+        if (campo.type === 'checkbox') campo.checked = valor;
+        else campo.value = valor;
+        campo.dispatchEvent(new Event('input', { bubbles: true }));
+        campo.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    if (ativo === 'menu-relatorios') {
+        document.getElementById('aplicar-filtro-relatorio')?.click();
+    }
+    window.scrollTo(0, posicao);
+    return true;
+}
+
+function iniciarSincronizacaoDadosCompartilhados() {
+    clearInterval(intervaloSincronizacaoDados);
+    revisaoDadosCompartilhados = null;
+
+    const verificar = async () => {
+        if (!usuarioLogado || verificandoRevisaoDados) return;
+        verificandoRevisaoDados = true;
+        try {
+            const resposta = await window.api.obterRevisaoDadosCompartilhados();
+            if (!resposta?.sucesso) return;
+            const revisao = Number(resposta.revisao || 0);
+            if (revisaoDadosCompartilhados === null) {
+                revisaoDadosCompartilhados = revisao;
+                return;
+            }
+            if (revisao === revisaoDadosCompartilhados) return;
+            if (await atualizarTelaListaCompartilhada()) revisaoDadosCompartilhados = revisao;
+        } catch (erro) {
+            // Uma falha temporária de rede não deve interromper a tela;
+            // a próxima consulta tenta sincronizar novamente.
+            console.warn('Não foi possível verificar alterações de outra estação:', erro?.message || erro);
+        } finally {
+            verificandoRevisaoDados = false;
+        }
+    };
+
+    verificar();
+    intervaloSincronizacaoDados = setInterval(verificar, 1000);
 }
 
 // Esconde módulos sem acesso; a autorização definitiva também é verificada no main.js.
@@ -372,6 +461,8 @@ function configurarBotaoLogout() {
         usuarioLogado = null; window.gestorUsuarioLogado = null;
         esconderNotificacoes();
         clearInterval(intervaloNotificacoes);
+        clearInterval(intervaloSincronizacaoDados);
+        revisaoDadosCompartilhados = null;
         document.getElementById('tela-login-gestor')?.remove();
         document.getElementById('botao-logout-gestor')?.remove();
         criarTelaLogin();
@@ -388,11 +479,106 @@ async function iniciarTelaInicial() {
             criarTelaAtivacao(estado || {});
             return;
         }
+        const implantacao = await window.api.obterEstadoImplantacaoFirebird();
+        if (implantacao?.precisaParear) {
+            criarTelaPareamentoFirebird();
+            return;
+        }
         criarTelaLogin();
     } catch (erro) {
         console.error('Erro ao verificar licença:', erro);
         criarTelaAtivacao({ erro: 'Não foi possível verificar a licença neste computador.' });
     }
+}
+
+async function criarTelaPareamentoFirebird() {
+    if (document.getElementById('tela-pareamento-firebird')) return;
+    const tela = document.createElement('div');
+    tela.id = 'tela-pareamento-firebird';
+    tela.style.cssText = 'position:fixed;inset:0;z-index:1000000;display:flex;align-items:center;justify-content:center;padding:24px;background:linear-gradient(135deg,#f5f7fb 0%,#e9eef7 100%);font-family:Arial,sans-serif;';
+    tela.innerHTML = `
+        <section style="width:min(520px,100%);box-sizing:border-box;background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:32px;box-shadow:0 18px 50px rgba(15,23,42,.14)">
+            <div style="width:54px;height:54px;margin:0 auto 14px;border-radius:15px;display:grid;place-items:center;background:#2563eb;color:#fff;font-weight:800">GF</div>
+            <h1 style="margin:0;text-align:center;color:#111827;font-size:23px">Conectar ao servidor da empresa</h1>
+            <p style="margin:8px 0 22px;text-align:center;color:#64748b;font-size:14px">Esta estação usará a base Firebird compartilhada. Procure o servidor e informe o código temporário gerado por um administrador nele.</p>
+            <label for="servidor-pareamento-firebird" style="display:block;margin:0 0 7px;color:#374151;font-size:13px;font-weight:700">Servidor encontrado na rede</label>
+            <div style="display:flex;gap:8px;margin-bottom:16px">
+                <select id="servidor-pareamento-firebird" style="flex:1;min-width:0;height:42px;border:1px solid #d1d5db;border-radius:9px;padding:0 10px;background:#fff"><option value="">Clique em procurar servidores</option></select>
+                <button id="procurar-pareamento-firebird" type="button" style="border:1px solid #d1d5db;border-radius:9px;background:#fff;padding:0 12px;cursor:pointer">Procurar</button>
+            </div>
+            <label for="codigo-pareamento-firebird" style="display:block;margin:0 0 7px;color:#374151;font-size:13px;font-weight:700">Código temporário</label>
+            <input id="codigo-pareamento-firebird" type="password" autocomplete="off" maxlength="100" placeholder="Cole o código gerado no servidor" style="width:100%;height:44px;box-sizing:border-box;border:1px solid #d1d5db;border-radius:9px;padding:0 12px;font:13px monospace">
+            <div id="erro-pareamento-firebird" role="alert" style="display:none;margin-top:12px;padding:10px 12px;border-radius:8px;background:#fef2f2;border:1px solid #fecaca;color:#b91c1c;font-size:13px"></div>
+            <button id="conectar-pareamento-firebird" type="button" style="width:100%;height:44px;margin-top:16px;border:0;border-radius:9px;background:#2563eb;color:#fff;font-weight:700;cursor:pointer">Conectar estação</button>
+            <p style="margin:16px 0 0;text-align:center;color:#94a3b8;font-size:11px">O código expira após cinco minutos e só pode ser usado uma vez.</p>
+        </section>`;
+    document.body.appendChild(tela);
+
+    const seletor = tela.querySelector('#servidor-pareamento-firebird');
+    const erro = tela.querySelector('#erro-pareamento-firebird');
+    const botaoProcurar = tela.querySelector('#procurar-pareamento-firebird');
+    const botaoConectar = tela.querySelector('#conectar-pareamento-firebird');
+    let servidores = [];
+    const mostrarErro = mensagem => {
+        erro.textContent = mensagem;
+        erro.style.display = 'block';
+    };
+    const procurar = async () => {
+        erro.style.display = 'none';
+        botaoProcurar.disabled = true;
+        botaoProcurar.textContent = 'Procurando…';
+        seletor.innerHTML = '<option value="">Procurando na rede local…</option>';
+        try {
+            const resultado = await window.api.descobrirServidoresFirebird();
+            servidores = resultado?.servidores || [];
+            if (!resultado?.sucesso || !servidores.length) {
+                seletor.innerHTML = '<option value="">Nenhum servidor encontrado</option>';
+                mostrarErro(resultado?.mensagem || 'Nenhum servidor respondeu. Confirme se os dois computadores estão na mesma rede local, se a rede do Windows no servidor está definida como Privada e se o serviço Firebird está em execução. Depois, clique em Procurar novamente.');
+                return;
+            }
+            seletor.innerHTML = servidores.map((servidor, indice) =>
+                `<option value="${indice}">${escaparLogin(servidor.nome)} — ${escaparLogin(servidor.host)}</option>`
+            ).join('');
+        } catch (falha) {
+            seletor.innerHTML = '<option value="">Falha na busca</option>';
+            mostrarErro('Não foi possível procurar o servidor na rede local. Confirme se os dois computadores estão na mesma rede e se a rede do Windows no servidor está definida como Privada.');
+        } finally {
+            botaoProcurar.disabled = false;
+            botaoProcurar.textContent = 'Procurar';
+        }
+    };
+    botaoProcurar.addEventListener('click', procurar);
+    botaoConectar.addEventListener('click', async () => {
+        erro.style.display = 'none';
+        const servidor = servidores[Number(seletor.value)];
+        const codigo = tela.querySelector('#codigo-pareamento-firebird').value.trim();
+        if (!servidor) return mostrarErro('Selecione o servidor da empresa.');
+        if (!codigo) return mostrarErro('Informe o código temporário gerado no servidor.');
+        botaoConectar.disabled = true;
+        botaoConectar.textContent = 'Validando conexão…';
+        try {
+            const resultado = await window.api.parearEstacaoFirebird({
+                host: servidor.host,
+                portaPareamento: servidor.portaPareamento,
+                serverId: servidor.id,
+                codigo
+            });
+            if (!resultado?.sucesso) {
+                mostrarErro(resultado?.mensagem || 'Não foi possível conectar esta estação.');
+                return;
+            }
+            botaoConectar.textContent = 'Conectado. Abrindo…';
+            window.location.reload();
+        } catch (falha) {
+            mostrarErro('A conexão falhou. Confira o código e tente novamente.');
+        } finally {
+            botaoConectar.disabled = false;
+            if (botaoConectar.isConnected && botaoConectar.textContent !== 'Conectado. Abrindo…') {
+                botaoConectar.textContent = 'Conectar estação';
+            }
+        }
+    });
+    await procurar();
 }
 
 function criarTelaAtivacao(estado) {
@@ -448,7 +634,7 @@ function criarTelaAtivacao(estado) {
                 return;
             }
             tela.remove();
-            criarTelaLogin();
+            iniciarTelaInicial();
         } catch (erroAtivacao) {
             console.error('Erro ao ativar licença:', erroAtivacao);
             erro.textContent = 'Ocorreu um erro ao validar a licença.';
@@ -467,10 +653,18 @@ function criarTelaAtivacao(estado) {
 
 
 // Desenha o formulário de autenticação e conecta o envio ao canal login.
-function criarTelaLogin() {
+async function criarTelaLogin() {
 
     if (document.getElementById('tela-login-gestor')) {
         return;
+    }
+
+    let precisaConfigurarAdministrador = false;
+    try {
+        const estadoInicial = await window.api.obterEstadoInicializacao();
+        precisaConfigurarAdministrador = estadoInicial?.necessitaAdministrador === true;
+    } catch (erro) {
+        console.error('Não foi possível verificar a configuração inicial:', erro);
     }
 
     const tela = document.createElement('div');
@@ -491,7 +685,7 @@ function criarTelaLogin() {
                 font-family: Arial, sans-serif;
             }
             #tela-login-gestor .login-card {
-                width: min(420px, 100%);
+                width: min(${precisaConfigurarAdministrador ? '480px' : '420px'}, 100%);
                 background: #fff;
                 border: 1px solid #e5e7eb;
                 border-radius: 18px;
@@ -607,17 +801,25 @@ function criarTelaLogin() {
 
         <div class="login-card">
             <div class="login-logo">GF</div>
-            <h1>Gestor Fácil</h1>
-            <p class="login-subtitulo">Acesse o sistema para continuar</p>
+            <h1>${precisaConfigurarAdministrador ? 'Configuração inicial' : 'Gestor Fácil'}</h1>
+            <p class="login-subtitulo">${precisaConfigurarAdministrador ? 'Crie a conta de administrador para começar a usar o sistema.' : 'Acesse o sistema para continuar'}</p>
 
             <form id="form-login-gestor">
+                ${precisaConfigurarAdministrador ? `
+                    <div class="login-campo">
+                        <label for="login-nome-admin">Nome do administrador</label>
+                        <input id="login-nome-admin" type="text" maxlength="200" autocomplete="name" placeholder="Seu nome" required autofocus>
+                    </div>
+                ` : ''}
                 <div class="login-campo">
                     <label for="login-usuario">Usuário</label>
                     <input
                         id="login-usuario"
                         type="text"
                         autocomplete="username"
-                        placeholder="Digite seu usuário"
+                        placeholder="${precisaConfigurarAdministrador ? 'Crie um nome de usuário' : 'Digite seu usuário'}"
+                        minlength="${precisaConfigurarAdministrador ? '3' : '1'}"
+                        maxlength="100"
                         required
                         autofocus
                     >
@@ -629,8 +831,9 @@ function criarTelaLogin() {
                         <input
                             id="login-senha"
                             type="password"
-                            autocomplete="current-password"
-                            placeholder="Digite sua senha"
+                            autocomplete="${precisaConfigurarAdministrador ? 'new-password' : 'current-password'}"
+                            minlength="${precisaConfigurarAdministrador ? '10' : '1'}"
+                            placeholder="${precisaConfigurarAdministrador ? 'Crie uma senha com pelo menos 10 caracteres' : 'Digite sua senha'}"
                             required
                         >
                         <button
@@ -642,16 +845,21 @@ function criarTelaLogin() {
                     </div>
                 </div>
 
+                ${precisaConfigurarAdministrador ? `
+                    <div class="login-campo">
+                        <label for="login-confirmar-senha">Confirmar senha</label>
+                        <input id="login-confirmar-senha" type="password" autocomplete="new-password" minlength="10" placeholder="Digite a senha novamente" required>
+                    </div>
+                ` : ''}
+
                 <div class="login-erro" id="login-erro"></div>
 
                 <button class="login-botao" id="botao-login" type="submit">
-                    Entrar
+                    ${precisaConfigurarAdministrador ? 'Criar administrador' : 'Entrar'}
                 </button>
             </form>
 
-            <div class="login-info">
-                Primeiro acesso: usuário <strong>admin</strong> · senha <strong>admin123</strong>
-            </div>
+            ${precisaConfigurarAdministrador ? '<div class="login-info">A senha será protegida e não poderá ser recuperada pelo suporte.</div>' : ''}
         </div>
     `;
 
@@ -663,7 +871,7 @@ function criarTelaLogin() {
     const botao = document.getElementById('botao-login');
     const mostrarSenha = document.getElementById('mostrar-senha-login');
 
-    mostrarSenha.addEventListener('click', () => {
+    mostrarSenha?.addEventListener('click', () => {
         const exibindo = senha.type === 'text';
         senha.type = exibindo ? 'password' : 'text';
         mostrarSenha.textContent = exibindo ? '👁️' : '🙈';
@@ -676,9 +884,31 @@ function criarTelaLogin() {
         erro.style.display = 'none';
         erro.textContent = '';
         botao.disabled = true;
-        botao.textContent = 'Entrando...';
+        botao.textContent = precisaConfigurarAdministrador ? 'Configurando...' : 'Entrando...';
 
         try {
+            if (precisaConfigurarAdministrador) {
+                const nome = document.getElementById('login-nome-admin').value.trim();
+                const usuario = document.getElementById('login-usuario').value.trim();
+                const senhaConfirmacao = document.getElementById('login-confirmar-senha').value;
+                if (senha.value !== senhaConfirmacao) {
+                    erro.textContent = 'As senhas não coincidem.';
+                    erro.style.display = 'block';
+                    return;
+                }
+                const criacao = await window.api.configurarAdministradorInicial({ nome, usuario, senha: senha.value });
+                if (!criacao?.sucesso) {
+                    erro.textContent = criacao?.mensagem || 'Não foi possível criar o administrador.';
+                    erro.style.display = 'block';
+                    return;
+                }
+                tela.remove();
+                await criarTelaLogin();
+                const campoUsuario = document.getElementById('login-usuario');
+                if (campoUsuario) campoUsuario.value = usuario;
+                return;
+            }
+
             const resultado = await window.api.login({
                 usuario: document.getElementById('login-usuario').value,
                 senha: senha.value
@@ -714,6 +944,7 @@ function criarTelaLogin() {
             atualizarNotificacoes();
             tela.remove();
             mostrarInicio();
+            iniciarSincronizacaoDadosCompartilhados();
 
         } catch (erroLogin) {
             console.error('Erro no login:', erroLogin);
@@ -721,7 +952,7 @@ function criarTelaLogin() {
             erro.style.display = 'block';
         } finally {
             botao.disabled = false;
-            botao.textContent = 'Entrar';
+            botao.textContent = precisaConfigurarAdministrador ? 'Criar administrador' : 'Entrar';
         }
     });
 
@@ -863,12 +1094,15 @@ async function mostrarInicio() {
     };
 
     try {
-        const [vendas, ordens, produtos, clientes] = await Promise.all([
-            window.api.listarVendas(),
-            window.api.listarOrdensServico(),
-            window.api.listarProdutos(),
-            window.api.listarClientes()
-        ]);
+        const dadosDashboard = await window.api.obterDadosDashboard();
+        if (!dadosDashboard || dadosDashboard.sucesso === false) {
+            throw new Error(dadosDashboard?.mensagem || 'Não foi possível consultar os dados do dashboard.');
+        }
+
+        const vendas = Array.isArray(dadosDashboard.vendas) ? dadosDashboard.vendas : [];
+        const ordens = Array.isArray(dadosDashboard.ordens) ? dadosDashboard.ordens : [];
+        const produtos = Array.isArray(dadosDashboard.produtos) ? dadosDashboard.produtos : [];
+        const clientes = Array.isArray(dadosDashboard.clientes) ? dadosDashboard.clientes : [];
 
         const vendasAtivas = (vendas || []).filter(v => !String(v.status || '').toLowerCase().includes('cancel'));
         const vendasHoje = vendasAtivas.filter(v => hojeMesmoDia(v.data_hora));
@@ -7947,9 +8181,15 @@ async function mostrarRelatorios() {
         if (intervalo.inicio > intervalo.fim) { alert('A data inicial não pode ser maior que a data final.'); return; }
 
         try {
-            const [vendas, ordens, produtos] = await Promise.all([
-                window.api.listarVendas(), window.api.listarOrdensServico(), window.api.listarProdutos()
-            ]);
+            const dadosRelatorio = await window.api.obterDadosRelatorio();
+            if (!dadosRelatorio || dadosRelatorio.sucesso === false) {
+                throw new Error(dadosRelatorio?.mensagem || 'Não foi possível consultar os dados do relatório.');
+            }
+
+            const vendas = Array.isArray(dadosRelatorio.vendas) ? dadosRelatorio.vendas : [];
+            const ordens = Array.isArray(dadosRelatorio.ordens) ? dadosRelatorio.ordens : [];
+            const produtos = Array.isArray(dadosRelatorio.produtos) ? dadosRelatorio.produtos : [];
+            const itensVenda = Array.isArray(dadosRelatorio.itensVenda) ? dadosRelatorio.itensVenda : [];
 
             const vendasPeriodo = vendas.filter(v => !String(v.status || '').toLowerCase().includes('cancel') && estaNoPeriodo(v.data_hora, intervalo));
             const ordensPeriodo = ordens.filter(os => estaNoPeriodo(os.data_hora_abertura, intervalo));
@@ -7973,25 +8213,26 @@ async function mostrarRelatorios() {
             document.getElementById('relatorio-estoque-baixo').textContent = String(estoqueBaixo);
             document.getElementById('relatorio-sem-estoque').textContent = String(semEstoque);
 
-            const detalhes = await Promise.all(vendasPeriodo.map(v => window.api.buscarVenda(v.id)));
             const mapaProdutos = new Map();
             const mapaPagamento = new Map();
 
-            detalhes.filter(Boolean).forEach(venda => {
+            vendasPeriodo.forEach(venda => {
                 const forma = String(venda.forma_pagamento || 'Não informado');
                 const pagamento = mapaPagamento.get(forma) || {quantidade:0,total:0};
                 pagamento.quantidade += 1;
                 pagamento.total += Number(venda.total || 0);
                 mapaPagamento.set(forma,pagamento);
+            });
 
-                (Array.isArray(venda.itens) ? venda.itens : []).forEach(item => {
-                    const id = Number(item.produto_id);
-                    const chave = Number.isInteger(id) && id > 0 ? `id-${id}` : `nome-${item.produto_nome || item.descricao || 'Produto'}`;
-                    const produto = mapaProdutos.get(chave) || {nome:item.produto_nome || item.descricao || 'Produto',quantidade:0,total:0};
-                    produto.quantidade += Number(item.quantidade || 0);
-                    produto.total += Number(item.subtotal || (Number(item.quantidade||0)*Number(item.preco_unitario||item.valor_unitario||0)) || 0);
-                    mapaProdutos.set(chave,produto);
-                });
+            const idsVendasPeriodo = new Set(vendasPeriodo.map(v => Number(v.id)));
+            itensVenda.filter(item => idsVendasPeriodo.has(Number(item.venda_id))).forEach(item => {
+                const id = Number(item.produto_id);
+                const nome = item.produto_nome || 'Produto';
+                const chave = Number.isInteger(id) && id > 0 ? `id-${id}` : `nome-${nome}`;
+                const produto = mapaProdutos.get(chave) || {nome,quantidade:0,total:0};
+                produto.quantidade += Number(item.quantidade || 0);
+                produto.total += Number(item.subtotal || (Number(item.quantidade||0)*Number(item.preco_unitario||0)) || 0);
+                mapaProdutos.set(chave,produto);
             });
 
             const produtosMaisVendidos = [...mapaProdutos.values()].sort((a,b)=>b.quantidade-a.quantidade || b.total-a.total).slice(0,10);
@@ -8051,7 +8292,7 @@ async function mostrarRelatorios() {
 
         } catch (erro) {
             console.error('Erro ao carregar relatórios:', erro);
-            alert('Não foi possível carregar os dados dos relatórios.');
+            alert(`Não foi possível carregar os dados dos relatórios.\n\n${erro?.message || 'Verifique a conexão com o banco de dados e tente novamente.'}`);
         }
     }
 
@@ -8227,6 +8468,7 @@ async function mostrarAuditoria() {
                     <button class="button secondary" id="botao-backup-auditoria" type="button">💾 Fazer backup</button>
                     <button class="button secondary" id="botao-restaurar-auditoria" type="button">🔄 Restaurar</button>
                     <button class="button secondary" id="botao-config-backup-auditoria" type="button">⚙️ Backup automático</button>
+                    <button class="button secondary" id="botao-parear-estacao-firebird" type="button" style="display:none;">🔗 Conectar estação</button>
                 </div>
             </div>
         </div>
@@ -8271,6 +8513,58 @@ async function mostrarAuditoria() {
     `;
 
     const botaoBackup = document.getElementById('botao-backup-auditoria');
+    const botaoPareamento = document.getElementById('botao-parear-estacao-firebird');
+    try {
+        const estadoImplantacao = await window.api.obterEstadoImplantacaoFirebird();
+        if (estadoImplantacao?.papel === 'servidor' && estadoImplantacao?.bancoCompartilhado) {
+            botaoPareamento.style.display = 'inline-flex';
+        }
+        if (estadoImplantacao?.papel === 'cliente' && estadoImplantacao?.bancoCompartilhado) {
+            ['botao-backup-auditoria', 'botao-restaurar-auditoria', 'botao-config-backup-auditoria'].forEach(id => {
+                const botao = document.getElementById(id);
+                if (botao) botao.style.display = 'none';
+            });
+        }
+    } catch (_) {}
+    botaoPareamento?.addEventListener('click', async () => {
+        botaoPareamento.disabled = true;
+        try {
+            const resposta = await window.api.gerarCodigoPareamentoFirebird();
+            if (!resposta?.sucesso) {
+                alert(resposta?.mensagem || 'Não foi possível gerar o código.');
+                return;
+            }
+            const modal = document.createElement('div');
+            modal.className = 'modal-overlay-gestor';
+            modal.style.cssText = 'position:fixed;inset:0;background:rgba(15,23,42,.48);display:flex;align-items:center;justify-content:center;padding:20px;z-index:100000;';
+            modal.innerHTML = `<div style="width:min(520px,calc(100vw - 32px));box-sizing:border-box;background:#fff;border-radius:16px;padding:24px;box-shadow:0 18px 50px rgba(15,23,42,.22);">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;"><h2 style="margin:0;font-size:20px;">Conectar uma estação</h2><button id="fechar-codigo-pareamento" class="button secondary" type="button">✕</button></div>
+                <p style="color:#64748b;font-size:14px;line-height:1.5;">No outro computador, procure este servidor e cole o código abaixo. Ele é temporário, de uso único e contém a credencial de conexão criptografada durante o pareamento.</p>
+                <input id="codigo-pareamento-gerado" readonly value="${escaparLogin(resposta.codigo)}" style="width:100%;box-sizing:border-box;padding:12px;border:1px solid #d1d5db;border-radius:9px;font:13px monospace;">
+                <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px;"><button id="copiar-codigo-pareamento" class="button" type="button">📋 Copiar código</button></div>
+            </div>`;
+            document.body.appendChild(modal);
+            modal.querySelector('#fechar-codigo-pareamento').onclick = () => modal.remove();
+            modal.addEventListener('click', event => { if (event.target === modal) modal.remove(); });
+            modal.querySelector('#copiar-codigo-pareamento').onclick = async event => {
+                try {
+                    await navigator.clipboard.writeText(resposta.codigo);
+                    event.currentTarget.textContent = 'Copiado';
+                } catch (_) {
+                    const campo = modal.querySelector('#codigo-pareamento-gerado');
+                    campo.select();
+                    document.execCommand('copy');
+                    event.currentTarget.textContent = 'Copiado';
+                }
+            };
+        } catch (erro) {
+            console.error('Erro ao gerar código para estação:', erro);
+            alert('Não foi possível gerar o código de pareamento.');
+        } finally {
+            botaoPareamento.disabled = false;
+        }
+    });
+
     botaoBackup?.addEventListener('click', async () => {
         if (!confirm('Deseja criar um backup completo do banco de dados agora?')) return;
         botaoBackup.disabled = true;
@@ -8295,6 +8589,7 @@ async function mostrarAuditoria() {
     const botaoConfigBackup = document.getElementById('botao-config-backup-auditoria');
     botaoConfigBackup?.addEventListener('click', async () => {
         const config = await window.api.obterConfigBackup();
+        const implantacao = await window.api.obterEstadoImplantacaoFirebird().catch(() => null);
         const modal = document.createElement('div');
         modal.id = 'modal-config-backup-gestor';
         modal.style.cssText = 'position:fixed;inset:0;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;z-index:9999;padding:20px;';
@@ -8310,7 +8605,7 @@ async function mostrarAuditoria() {
                     <div><label style="display:block;font-size:12px;font-weight:700;margin-bottom:6px;">Manter últimos backups</label><input id="backup-auto-manter" type="number" min="1" max="100" value="${Number(config?.manter || 7)}" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #d1d5db;border-radius:8px;"></div>
                 </div>
                 <div style="margin-top:14px;"><label style="display:block;font-size:12px;font-weight:700;margin-bottom:6px;">Pasta de destino</label><div style="display:flex;gap:8px;"><input id="backup-auto-pasta" readonly value="${escaparLogin(config?.pasta || '')}" style="flex:1;padding:10px;border:1px solid #d1d5db;border-radius:8px;background:#f9fafb;"><button class="button secondary" id="backup-auto-escolher" type="button">📁 Escolher</button></div></div>
-                <div style="margin-top:16px;padding:12px;border-radius:9px;background:#f8fafc;border:1px solid #e5e7eb;font-size:12px;color:#64748b;">O backup é executado no horário configurado enquanto o Gestor Fácil estiver aberto. Você pode gerar mais de um no mesmo dia: ao alterar o horário, o novo agendamento será respeitado. Se o horário já tiver passado, o backup será iniciado ao salvar.</div>
+                <div style="margin-top:16px;padding:12px;border-radius:9px;background:#f8fafc;border:1px solid #e5e7eb;font-size:12px;color:#64748b;">O backup é executado no horário configurado enquanto o Gestor Fácil estiver aberto${implantacao?.papel === 'servidor' ? ' no computador servidor' : ''}. Você pode gerar mais de um no mesmo dia: ao alterar o horário, o novo agendamento será respeitado. Se o horário já tiver passado, o backup será iniciado ao salvar.${implantacao?.papel === 'servidor' ? ' A pasta de destino precisa estar acessível ao serviço Firebird.' : ''}</div>
                 <div style="margin-top:10px;font-size:12px;color:#64748b;">Último backup automático registrado: <strong>${config?.ultimoBackupDataHora && !Number.isNaN(new Date(config.ultimoBackupDataHora).getTime()) ? new Date(config.ultimoBackupDataHora).toLocaleString('pt-BR') : (config?.ultimoBackup ? config.ultimoBackup.split('-').reverse().join('/') : 'Ainda não realizado')}</strong></div>
                 ${config?.ultimoErroBackup ? `<div style="margin-top:8px;padding:10px 12px;border-radius:8px;background:#fef2f2;border:1px solid #fecaca;color:#991b1b;font-size:12px;"><strong>Última falha:</strong> ${escaparLogin(config.ultimoErroBackup)}${config.ultimoErroBackupDataHora && !Number.isNaN(new Date(config.ultimoErroBackupDataHora).getTime()) ? ` · ${new Date(config.ultimoErroBackupDataHora).toLocaleString('pt-BR')}` : ''}</div>` : ''}
                 <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:20px;"><button class="button secondary" id="backup-auto-cancelar" type="button">Cancelar</button><button class="button secondary" id="backup-auto-testar" type="button">🧪 Testar agora</button><button class="button" id="backup-auto-salvar" type="button">💾 Salvar configuração</button></div>
@@ -8370,8 +8665,13 @@ async function mostrarAuditoria() {
 
     const botaoRestaurar = document.getElementById('botao-restaurar-auditoria');
     botaoRestaurar?.addEventListener('click', async () => {
+        const implantacaoBackup = await window.api.obterEstadoImplantacaoFirebird().catch(() => null);
+        const avisoEstacoes = implantacaoBackup?.papel === 'servidor' && implantacaoBackup?.bancoCompartilhado
+            ? 'Feche o Gestor Fácil em todas as estações antes de continuar.\n\n'
+            : '';
         const confirmar = confirm(
             'ATENÇÃO! A restauração substituirá os dados atuais pelo conteúdo do backup.\n\n' +
+            avisoEstacoes +
             'Antes de restaurar, o sistema criará automaticamente uma cópia de segurança do banco atual.\n\n' +
             'Deseja continuar?'
         );
@@ -8391,7 +8691,7 @@ async function mostrarAuditoria() {
             alert(
                 'Backup restaurado com sucesso!\n\n' +
                 'O Gestor Fácil será reiniciado para carregar os dados restaurados.\n\n' +
-                'Uma cópia de segurança do banco anterior foi criada em Documentos:\n' +
+                'Cópia de segurança anterior:\n' +
                 (resposta.nome_backup_seguranca || 'backup de segurança')
             );
         } catch (erro) {
@@ -8618,8 +8918,9 @@ async function mostrarAuditoria() {
     }
 
     const carregar = async () => {
+        try {
         const resposta = await window.api.listarAuditoria({limite:1000});
-        if (!resposta?.sucesso) { alert(resposta?.mensagem || 'Não foi possível carregar a auditoria.'); return; }
+        if (!resposta?.sucesso) throw new Error(resposta?.mensagem || 'O banco não retornou os registros de auditoria.');
         registros = Array.isArray(resposta.registros) ? resposta.registros : [];
         try {
             const respostaUsuarios = await window.api.listarUsuarios();
@@ -8643,6 +8944,12 @@ async function mostrarAuditoria() {
         });
         aplicarCards();
         render();
+        } catch (erro) {
+            console.error('Erro ao carregar auditoria:', erro);
+            const total = document.getElementById('aud-total');
+            if (total) total.textContent = 'Não foi possível carregar os registros';
+            if (tabela) tabela.innerHTML = `<tr><td colspan="8" class="empty-table">Falha ao carregar a auditoria: ${esc(erro?.message || 'erro inesperado')}. Clique em Atualizar para tentar novamente.</td></tr>`;
+        }
     };
 
     const controles = [filtroUsuario, filtroModulo, filtroAcao, filtroNivel, dataInicial, dataFinal];

@@ -4,7 +4,7 @@ const os = require('os');
 const path = require('path');
 
 function caminhoChavePrivada() {
-    return path.join(process.env.APPDATA || os.homedir(), 'Gestor Facil Licencas', 'license-private.pem');
+    return path.join(process.env.APPDATA || os.homedir(), 'Gestor Facil Licencas', 'license-private-v2.pem');
 }
 
 function gerarLicenca({ cliente, maquina, dias }) {

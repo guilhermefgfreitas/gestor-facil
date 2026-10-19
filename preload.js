@@ -12,6 +12,16 @@ contextBridge.exposeInMainWorld('api', {
 
     obterEstadoLicenca: () => ipcRenderer.invoke('obter-estado-licenca'),
 
+    obterEstadoInicializacao: () => ipcRenderer.invoke('obter-estado-inicializacao'),
+
+    configurarAdministradorInicial: (dados) => ipcRenderer.invoke('configurar-administrador-inicial', dados),
+
+    descobrirServidoresFirebird: () => ipcRenderer.invoke('descobrir-servidores-firebird'),
+    testarConexaoFirebird: dados => ipcRenderer.invoke('testar-conexao-firebird', dados),
+    obterEstadoImplantacaoFirebird: () => ipcRenderer.invoke('obter-estado-implantacao-firebird'),
+    parearEstacaoFirebird: dados => ipcRenderer.invoke('parear-estacao-firebird', dados),
+    gerarCodigoPareamentoFirebird: () => ipcRenderer.invoke('gerar-codigo-pareamento-firebird'),
+
     ativarLicenca: (codigo) => ipcRenderer.invoke('ativar-licenca', codigo),
 
     verificarAtualizacoes: () => ipcRenderer.invoke('verificar-atualizacoes'),
@@ -56,6 +66,8 @@ contextBridge.exposeInMainWorld('api', {
         );
 
     },
+
+    obterRevisaoDadosCompartilhados: () => ipcRenderer.invoke('obter-revisao-dados-compartilhados'),
 
 
     cadastrarProduto: (produto) => {
@@ -242,6 +254,9 @@ contextBridge.exposeInMainWorld('api', {
         );
 
     },
+
+    obterDadosRelatorio: () => ipcRenderer.invoke('obter-dados-relatorio'),
+    obterDadosDashboard: () => ipcRenderer.invoke('obter-dados-dashboard'),
 
 
     buscarVenda: (id) => {

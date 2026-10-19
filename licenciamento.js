@@ -5,7 +5,10 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { app } = require('electron');
 
-const CHAVE_PUBLICA = path.join(__dirname, 'licenses', 'license-public.pem');
+const CHAVES_PUBLICAS = [
+    path.join(__dirname, 'licenses', 'license-public.pem'),
+    path.join(__dirname, 'licenses', 'license-public-v2.pem')
+];
 const ARQUIVO_LICENCA = path.join(app.getPath('userData'), 'licenca.json');
 const PRODUTO = 'gestor-facil';
 
@@ -37,8 +40,14 @@ function validarToken(token, codigoMaquina) {
         const assinatura = Buffer.from(partes[1], 'base64url');
         const payloadTexto = payloadBytes.toString('utf8');
         const payload = JSON.parse(payloadTexto);
-        const chavePublica = fs.readFileSync(CHAVE_PUBLICA, 'utf8');
-        const assinaturaValida = crypto.verify(null, Buffer.from(payloadTexto), chavePublica, assinatura);
+        const assinaturaValida = CHAVES_PUBLICAS.some((arquivo) => {
+            try {
+                const chavePublica = fs.readFileSync(arquivo, 'utf8');
+                return crypto.verify(null, Buffer.from(payloadTexto), chavePublica, assinatura);
+            } catch (_) {
+                return false;
+            }
+        });
 
         if (!assinaturaValida || payload.produto !== PRODUTO) {
             return { valida: false, mensagem: 'A licença não foi emitida pelo Gestor Fácil.' };

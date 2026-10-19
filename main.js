@@ -3,12 +3,27 @@
  * Reúne banco SQLite, janelas, autenticação, permissões, backups e operações
  * de negócio. A tela acessa essas funções apenas pelos canais do preload.
  */
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, safeStorage } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
+const descobertaFirebird = require('./database/firebird/descoberta');
+const configuracaoFirebird = require('./database/firebird/configuracao');
+const { criarConexaoFirebird } = require('./database/firebird/conexao');
+const { criarBackupFirebird, validarBackupFirebird, restaurarBackupFirebird } = require('./database/firebird/backup');
+const {
+    obterEstadoInicializacaoFirebird,
+    configurarAdministradorInicialFirebird
+} = require('./database/firebird/inicializacao');
+const { criarAdaptadorSqlite } = require('./database/adaptador-sqlite');
+const { migrarSqliteParaFirebird } = require('./tools/migrar-sqlite-para-firebird.cjs');
+const {
+    PORTA_PAREAMENTO,
+    criarServidorPareamento,
+    parearComServidor
+} = require('./database/firebird/pareamento');
 
 // Mantém userData estável mesmo se o nome exibido ou o empacotamento mudar.
 // Este caminho já corresponde à pasta usada pela configuração de backup existente.
@@ -16,8 +31,15 @@ app.setPath('userData', path.join(app.getPath('appData'), 'gestor-facil'));
 
 const licenciamento = require('./licenciamento');
 const db = require('./database/banco');
+let acessoBanco = criarAdaptadorSqlite(db);
+let tipoBancoAtivo = 'sqlite';
+let configuracaoFirebirdRuntime = null;
+let bancoFirebirdRuntime = null;
+let papelInstalacao = 'desconhecido';
+let servidorPareamentoFirebird = null;
 
 let atualizacaoPronta = false;
+let anunciadorFirebird = null;
 autoUpdater.autoDownload = true;
 autoUpdater.autoInstallOnAppQuit = true;
 
@@ -90,15 +112,15 @@ for (const coluna of ['dados_antes', 'dados_depois']) {
 }
 
 // Registra uma ação administrativa; falhas de auditoria não interrompem a operação principal.
-function registrarAuditoria(usuario, dados = {}) {
+async function registrarAuditoria(usuario, dados = {}) {
     try {
         const u = usuario || {};
-        db.prepare(`
+        await acessoBanco.executar(`
             INSERT INTO auditoria (
                 usuario_id, usuario_nome, usuario_login, perfil,
                 acao, modulo, descricao, entidade_tipo, entidade_id, dados_antes, dados_depois
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
+        `, [
             u.id ? Number(u.id) : null,
             String(u.nome || ''),
             String(u.usuario || ''),
@@ -110,7 +132,7 @@ function registrarAuditoria(usuario, dados = {}) {
             dados.entidade_id != null && dados.entidade_id !== '' ? Number(dados.entidade_id) : null,
             dados.dados_antes ? JSON.stringify(dados.dados_antes) : null,
             dados.dados_depois ? JSON.stringify(dados.dados_depois) : null
-        );
+        ]);
     } catch (erro) {
         console.error('Erro ao registrar auditoria:', erro.message);
     }
@@ -210,54 +232,6 @@ function gerarSenha(senha, salt = crypto.randomBytes(16).toString('hex')) {
 }
 
 
-// Só cria a conta de administração padrão quando ainda não existe nenhum usuário.
-function garantirAdministradorInicial() {
-
-    const total = db
-        .prepare('SELECT COUNT(*) AS total FROM usuarios')
-        .get();
-
-    if (Number(total?.total || 0) > 0) {
-        return;
-    }
-
-    const senha = gerarSenha('admin123');
-
-    db.prepare(`
-        INSERT INTO usuarios (
-            nome,
-            usuario,
-            senha_hash,
-            senha_salt,
-            perfil,
-            ativo,
-            primeiro_acesso
-        )
-        VALUES (
-            @nome,
-            @usuario,
-            @senha_hash,
-            @senha_salt,
-            'administrador',
-            1,
-            1
-        )
-    `).run({
-        nome: 'Administrador',
-        usuario: 'admin',
-        senha_hash: senha.hash,
-        senha_salt: senha.salt
-    });
-
-    console.log('Usuário administrador inicial criado: admin');
-
-}
-
-
-garantirAdministradorInicial();
-
-
-
 /*
     ==================================================
     GESTÃO DE SESSÃO E PERMISSÕES — ETAPA 5.3
@@ -300,57 +274,65 @@ function permissoesAdministrador() {
     }));
 }
 
-// Prepara as permissões que faltarem e garante acesso completo aos administradores.
-function garantirPermissoesUsuario(usuarioId, perfil) {
-    if (perfil === 'administrador') {
-        for (const p of permissoesAdministrador()) {
-            db.prepare(`
-                INSERT INTO permissoes_usuarios (usuario_id, modulo, consultar, criar, editar, excluir)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(usuario_id, modulo) DO UPDATE SET
-                    consultar = excluded.consultar,
-                    criar = excluded.criar,
-                    editar = excluded.editar,
-                    excluir = excluded.excluir,
-                    atualizado_em = CURRENT_TIMESTAMP
-            `).run(usuarioId, p.modulo, p.consultar, p.criar, p.editar, p.excluir);
-        }
-        return;
-    }
+// Executa a manutenção de permissões dentro de uma transação já aberta.
+async function garantirPermissoesNoEscopo(banco, usuarioId, perfil) {
+    const permissoes = perfil === 'administrador'
+        ? permissoesAdministrador()
+        : MODULOS_PERMISSAO.map(modulo => ({
+            modulo,
+            ...(PERMISSOES_FUNCIONARIO_PADRAO[modulo] || { consultar: 0, criar: 0, editar: 0, excluir: 0 })
+        }));
 
-    for (const modulo of MODULOS_PERMISSAO) {
-        const p = PERMISSOES_FUNCIONARIO_PADRAO[modulo] || { consultar: 0, criar: 0, editar: 0, excluir: 0 };
-        db.prepare(`
+    for (const p of permissoes) {
+        const existente = await banco.consultarUm(
+            'SELECT id FROM permissoes_usuarios WHERE usuario_id = ? AND modulo = ?',
+            [usuarioId, p.modulo]
+        );
+        if (existente) {
+            if (perfil === 'administrador') {
+                await banco.executar(`
+                    UPDATE permissoes_usuarios
+                    SET consultar = ?, criar = ?, editar = ?, excluir = ?, atualizado_em = CURRENT_TIMESTAMP
+                    WHERE usuario_id = ? AND modulo = ?
+                `, [p.consultar, p.criar, p.editar, p.excluir, usuarioId, p.modulo]);
+            }
+            continue;
+        }
+        await banco.executar(`
             INSERT INTO permissoes_usuarios (usuario_id, modulo, consultar, criar, editar, excluir)
             VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(usuario_id, modulo) DO NOTHING
-        `).run(usuarioId, modulo, p.consultar, p.criar, p.editar, p.excluir);
+        `, [usuarioId, p.modulo, p.consultar, p.criar, p.editar, p.excluir]);
     }
 }
 
-function buscarPermissoesUsuario(usuarioId, perfil) {
+// Prepara permissões ausentes e garante acesso completo aos administradores.
+async function garantirPermissoesUsuario(usuarioId, perfil) {
+    return acessoBanco.transacao(banco => garantirPermissoesNoEscopo(banco, usuarioId, perfil));
+}
+
+async function buscarPermissoesUsuario(usuarioId, perfil) {
     if (perfil === 'administrador') return permissoesAdministrador();
-    garantirPermissoesUsuario(usuarioId, perfil);
-    return db.prepare(`
+    await garantirPermissoesUsuario(usuarioId, perfil);
+    return acessoBanco.consultar(`
         SELECT modulo, consultar, criar, editar, excluir
         FROM permissoes_usuarios
         WHERE usuario_id = ?
         ORDER BY id
-    `).all(usuarioId);
+    `, [usuarioId]);
 }
 
 // Confere no banco o estado ativo e a permissão exigida para a chamada atual.
-function usuarioTemPermissao(usuarioId, modulo, acao = 'consultar') {
-    const usuario = db.prepare(`SELECT id, perfil, ativo FROM usuarios WHERE id = ?`).get(usuarioId);
+async function usuarioTemPermissao(usuarioId, modulo, acao = 'consultar') {
+    const usuario = await acessoBanco.consultarUm('SELECT id, perfil, ativo FROM usuarios WHERE id = ?', [usuarioId]);
     if (!usuario || Number(usuario.ativo) !== 1) return false;
     if (usuario.perfil === 'administrador') return true;
 
-    garantirPermissoesUsuario(usuario.id, usuario.perfil);
-    const permissao = db.prepare(`
+    await garantirPermissoesUsuario(usuario.id, usuario.perfil);
+    const permissao = await acessoBanco.consultarUm(`
         SELECT ${acao === 'criar' || acao === 'editar' || acao === 'excluir' ? acao : 'consultar'} AS permitido
         FROM permissoes_usuarios
         WHERE usuario_id = ? AND modulo = ?
-    `).get(usuario.id, modulo);
+    `, [usuario.id, modulo]);
     return Number(permissao?.permitido || 0) === 1;
 }
 
@@ -388,7 +370,14 @@ function definirPermissaoPorCanal(canal) {
         'listar-movimentacoes-estoque': ['estoque', 'consultar'],
         'entrada-estoque': ['estoque', 'criar'],
         'saida-estoque': ['estoque', 'criar'],
-        'ajuste-estoque': ['estoque', 'editar']
+        'ajuste-estoque': ['estoque', 'editar'],
+
+        // O módulo Relatórios precisa de uma leitura própria. Permitir que
+        // ele dependa das permissões de Vendas, OS e Produtos fazia usuários
+        // autorizados para relatórios receberem objetos de acesso negado no
+        // lugar das listas e a tela quebrava ao tentar filtrá-los.
+        'obter-dados-dashboard': ['dashboard', 'consultar'],
+        'obter-dados-relatorio': ['relatorios', 'consultar']
     };
     return regras[canal] || null;
 }
@@ -404,30 +393,30 @@ function obterIdAuditoria(canal, dados, resultado) {
     return Number(typeof d === 'object' ? d.id : d) || null;
 }
 
-function capturarSnapshotAuditoria(canal, dados, resultado) {
+async function capturarSnapshotAuditoria(canal, dados, resultado) {
     const id = obterIdAuditoria(canal, dados, resultado);
     if (!id) return null;
     try {
         if (canal.includes('produto') || canal.includes('estoque')) {
-            return db.prepare(`SELECT id,nome,codigo,sku,codigo_barras,categoria,preco_custo,preco_venda,estoque,estoque_minimo FROM produtos WHERE id = ?`).get(id) || null;
+            return await acessoBanco.consultarUm(`SELECT id,nome,codigo,sku,codigo_barras,categoria,preco_custo,preco_venda,estoque,estoque_minimo FROM produtos WHERE id = ?`, [id]);
         }
         if (canal.includes('cliente')) {
-            return db.prepare(`SELECT id,nome,cpf_cnpj,telefone,celular,email,cep,endereco,numero,complemento,bairro,cidade,estado,observacoes FROM clientes WHERE id = ?`).get(id) || null;
+            return await acessoBanco.consultarUm(`SELECT id,nome,cpf_cnpj,telefone,celular,email,cep,endereco,numero,complemento,bairro,cidade,estado,observacoes FROM clientes WHERE id = ?`, [id]);
         }
         if (canal.includes('ordem-servico')) {
-            return db.prepare(`SELECT id,numero,cliente_id,tipo_equipamento,marca,modelo,numero_serie,sistema_operacional,acessorios,estado_fisico,avarias,problema_relatado,diagnostico,servico_realizado,previsao_entrega,status,valor_pecas,valor_mao_obra,desconto,total,observacoes FROM ordens_servico WHERE id = ?`).get(id) || null;
+            return await acessoBanco.consultarUm(`SELECT id,numero,cliente_id,tipo_equipamento,marca,modelo,numero_serie,sistema_operacional,acessorios,estado_fisico,avarias,problema_relatado,diagnostico,servico_realizado,previsao_entrega,status,valor_pecas,valor_mao_obra,desconto,total,observacoes FROM ordens_servico WHERE id = ?`, [id]);
         }
         if (canal.includes('usuario')) {
-            return db.prepare(`SELECT id,nome,usuario,perfil,ativo,primeiro_acesso FROM usuarios WHERE id = ?`).get(id) || null;
+            return await acessoBanco.consultarUm(`SELECT id,nome,usuario,perfil,ativo,primeiro_acesso FROM usuarios WHERE id = ?`, [id]);
         }
         if (canal.includes('garantia')) {
-            return db.prepare(`SELECT id,venda_id,os_id,cliente_id,produto_id,descricao,prazo_dias,data_inicio,data_fim,status,observacoes,cobertura,exclusoes FROM garantias WHERE id = ?`).get(id) || null;
+            return await acessoBanco.consultarUm(`SELECT id,venda_id,os_id,cliente_id,produto_id,descricao,prazo_dias,data_inicio,data_fim,status,observacoes,cobertura,exclusoes FROM garantias WHERE id = ?`, [id]);
         }
         if (canal === 'finalizar-venda' || canal === 'excluir-venda' || canal === 'cancelar-venda') {
-            const venda = db.prepare(`SELECT id,numero,cliente_id,subtotal,desconto,total,forma_pagamento,observacoes,status,cancelada_em,cancelamento_motivo,data_hora FROM vendas WHERE id = ?`).get(id) || null;
+            const venda = await acessoBanco.consultarUm(`SELECT id,numero,cliente_id,subtotal,desconto,total,forma_pagamento,observacoes,status,cancelada_em,cancelamento_motivo,data_hora FROM vendas WHERE id = ?`, [id]);
             if (!venda) return null;
             if (canal === 'excluir-venda' || canal === 'cancelar-venda') {
-                venda.itens = db.prepare(`SELECT id,produto_id,quantidade,preco_unitario,subtotal FROM itens_venda WHERE venda_id = ? ORDER BY id`).all(id);
+                venda.itens = await acessoBanco.consultar(`SELECT id,produto_id,quantidade,preco_unitario,subtotal FROM itens_venda WHERE venda_id = ? ORDER BY id`, [id]);
             }
             return venda;
         }
@@ -500,7 +489,21 @@ ipcMain.handle = (canal, listener) => {
             return listener(event, ...args);
         }
 
+        if ([
+            'obter-estado-inicializacao',
+            'configurar-administrador-inicial',
+            'obter-estado-implantacao-firebird',
+            'descobrir-servidores-firebird',
+            'testar-conexao-firebird',
+            'parear-estacao-firebird'
+        ].includes(canal)) {
+            return listener(event, ...args);
+        }
+
         if (canal === 'login') {
+            if (tipoBancoAtivo === 'pareamento') {
+                return { sucesso: false, mensagem: 'Esta estação ainda não está conectada ao servidor. Conclua o pareamento para entrar.' };
+            }
             const estadoLicenca = licenciamento.obterEstadoLicenca();
             if (!estadoLicenca.ativa) {
                 return { sucesso: false, mensagem: 'Ative o Gestor Fácil para continuar.' };
@@ -509,15 +512,16 @@ ipcMain.handle = (canal, listener) => {
             if (resultado?.sucesso && resultado.usuario?.id) {
                 const usuarioId = Number(resultado.usuario.id);
                 const perfil = resultado.usuario.perfil;
-                garantirPermissoesUsuario(usuarioId, perfil);
+                await garantirPermissoesUsuario(usuarioId, perfil);
+                const permissoes = await buscarPermissoesUsuario(usuarioId, perfil);
                 sessoesGestor.set(event.sender.id, {
                     id: usuarioId,
                     nome: resultado.usuario.nome,
                     usuario: resultado.usuario.usuario,
                     perfil,
-                    permissoes: buscarPermissoesUsuario(usuarioId, perfil)
+                    permissoes
                 });
-                resultado.usuario.permissoes = buscarPermissoesUsuario(usuarioId, perfil);
+                resultado.usuario.permissoes = permissoes;
             }
             return resultado;
         }
@@ -551,7 +555,7 @@ ipcMain.handle = (canal, listener) => {
         }
 
         const regra = definirPermissaoPorCanal(canal);
-        if (regra && !usuarioTemPermissao(sessao.id, regra[0], regra[1])) {
+        if (regra && !(await usuarioTemPermissao(sessao.id, regra[0], regra[1]))) {
             return { sucesso: false, mensagem: 'Você não possui permissão para realizar esta ação.' };
         }
 
@@ -562,17 +566,17 @@ ipcMain.handle = (canal, listener) => {
         }
 
         const snapshotAntes = ['editar-produto','excluir-produto','editar-cliente','excluir-cliente','editar-ordem-servico','excluir-ordem-servico','editar-garantia','editar-usuario','alterar-senha-usuario','alternar-status-usuario','salvar-permissoes-usuario','entrada-estoque','saida-estoque','ajuste-estoque','excluir-venda','cancelar-venda'].includes(canal)
-            ? capturarSnapshotAuditoria(canal, args[0], null)
+            ? await capturarSnapshotAuditoria(canal, args[0], null)
             : null;
 
         const resultado = await listener(event, ...args);
 
         if (resultado?.sucesso !== false) {
             const snapshotDepois = ['cadastrar-produto','editar-produto','cadastrar-cliente','editar-cliente','cadastrar-ordem-servico','editar-ordem-servico','editar-garantia','cadastrar-usuario','editar-usuario','alternar-status-usuario','salvar-permissoes-usuario','entrada-estoque','saida-estoque','ajuste-estoque','cadastrar-garantia','finalizar-venda','cancelar-venda'].includes(canal)
-                ? capturarSnapshotAuditoria(canal, args[0], resultado)
+                ? await capturarSnapshotAuditoria(canal, args[0], resultado)
                 : null;
             const audit = mapaAuditoriaCanal(canal, args[0], resultado, sessao, snapshotAntes, snapshotDepois);
-            if (audit) registrarAuditoria(sessao, audit);
+            if (audit) await registrarAuditoria(sessao, audit);
         }
 
         return resultado;
@@ -593,6 +597,175 @@ app.on('browser-window-created', (_event, janela) => {
 
 
 ipcMain.handle('obter-estado-licenca', () => licenciamento.obterEstadoLicenca());
+
+ipcMain.handle('obter-estado-inicializacao', async () => {
+    try {
+        if (tipoBancoAtivo === 'pareamento') {
+            return { necessitaAdministrador: false, precisaParear: true };
+        }
+        if (tipoBancoAtivo === 'firebird') {
+            const estado = await obterEstadoInicializacaoFirebird(acessoBanco);
+            return { necessitaAdministrador: estado.precisaConfigurarAdministrador };
+        }
+        const resultado = await acessoBanco.consultarUm('SELECT COUNT(*) AS total FROM usuarios');
+        return { necessitaAdministrador: Number(resultado?.total || 0) === 0 };
+    } catch (erro) {
+        console.error('Não foi possível verificar a inicialização do sistema:', erro);
+        return { necessitaAdministrador: false, mensagem: 'Não foi possível consultar o banco de dados.' };
+    }
+});
+
+ipcMain.handle('configurar-administrador-inicial', async (_event, dados) => {
+    if (tipoBancoAtivo === 'pareamento') {
+        return { sucesso: false, mensagem: 'Conecte esta estação ao servidor antes de configurar usuários.' };
+    }
+    if (!licenciamento.obterEstadoLicenca().ativa) {
+        return { sucesso: false, mensagem: 'Ative o Gestor Fácil para continuar.' };
+    }
+
+    const nome = String(dados?.nome || '').trim();
+    const usuario = String(dados?.usuario || '').trim();
+    const senha = String(dados?.senha || '');
+    if (!nome || nome.length > 200) return { sucesso: false, mensagem: 'Informe um nome válido para o administrador.' };
+    if (!/^[a-zA-Z0-9._-]{3,100}$/.test(usuario)) {
+        return { sucesso: false, mensagem: 'O usuário deve ter de 3 a 100 caracteres: letras, números, ponto, hífen ou sublinhado.' };
+    }
+    if (senha.length < 10) return { sucesso: false, mensagem: 'A senha do administrador deve ter pelo menos 10 caracteres.' };
+
+    try {
+        if (tipoBancoAtivo === 'firebird') {
+            const administrador = await configurarAdministradorInicialFirebird(acessoBanco, { nome, usuario, senha });
+            await registrarAuditoria(administrador, {
+                acao: 'criar', modulo: 'seguranca', descricao: 'Configurou o administrador inicial do sistema.',
+                entidade_tipo: 'usuario', entidade_id: administrador.id
+            });
+            return { sucesso: true, usuario: { id: administrador.id, nome, usuario } };
+        }
+
+        const usuarioId = await acessoBanco.transacao(async banco => {
+            const total = await banco.consultarUm('SELECT COUNT(*) AS total FROM usuarios');
+            if (Number(total?.total || 0) !== 0) {
+                throw new Error('A configuração inicial já foi concluída. Entre com uma conta existente.');
+            }
+
+            const senhaSegura = gerarSenha(senha);
+            await banco.executar(`
+                INSERT INTO usuarios (nome, usuario, senha_hash, senha_salt, perfil, ativo, primeiro_acesso)
+                VALUES (?, ?, ?, ?, 'administrador', 1, 0)
+            `, [nome, usuario, senhaSegura.hash, senhaSegura.salt]);
+            const id = Number(insercao.lastInsertRowid);
+            if (!id) throw new Error('Não foi possível criar a conta de administrador.');
+            await garantirPermissoesNoEscopo(banco, id, 'administrador');
+            return id;
+        });
+
+        await registrarAuditoria({ id: usuarioId, nome, usuario, perfil: 'administrador' }, {
+            acao: 'criar', modulo: 'seguranca', descricao: 'Configurou o administrador inicial do sistema.',
+            entidade_tipo: 'usuario', entidade_id: usuarioId
+        });
+        return { sucesso: true, usuario: { id: usuarioId, nome, usuario } };
+    } catch (erro) {
+        if (['SQLITE_CONSTRAINT_UNIQUE', 'FIREBIRD_CONSTRAINT_UNIQUE'].includes(erro.code)) {
+            return { sucesso: false, mensagem: 'Este nome de usuário já está em uso.' };
+        }
+        return { sucesso: false, mensagem: erro.message || 'Não foi possível configurar o administrador inicial.' };
+    }
+});
+
+// Procura servidores somente na rede local; a descoberta nunca transmite senhas.
+ipcMain.handle('descobrir-servidores-firebird', async () => {
+    try {
+        const servidores = await descobertaFirebird.descobrirServidores();
+        return { sucesso: true, servidores };
+    } catch (erro) {
+        console.error('Falha ao procurar Firebird na rede local:', erro);
+        return { sucesso: false, servidores: [], mensagem: 'Não foi possível procurar o servidor na rede local.' };
+    }
+});
+
+// Testa os dados digitados na estação sem salvá-los e sem alterar o servidor.
+ipcMain.handle('testar-conexao-firebird', async (_event, dados = {}) => {
+    let banco;
+    try {
+        banco = criarConexaoFirebird({
+            host: dados.host,
+            port: dados.port,
+            database: dados.database,
+            user: dados.user,
+            password: dados.password
+        }, { timeoutMs: 8000, limiteConexoes: 1 });
+        const estado = await obterEstadoInicializacaoFirebird(banco);
+        return {
+            sucesso: true,
+            servidorPreparado: true,
+            precisaConfigurarAdministrador: estado.precisaConfigurarAdministrador
+        };
+    } catch (erro) {
+        console.warn('Falha ao validar conexão Firebird informada:', erro.message);
+        return {
+            sucesso: false,
+            mensagem: 'Não foi possível validar a conexão ou o esquema do Gestor Fácil. Confira servidor, porta, alias, credenciais e instalação do banco.'
+        };
+    } finally {
+        if (banco) {
+            try { await banco.fechar(); } catch (erro) {
+                console.warn('Falha ao encerrar conexão de validação Firebird:', erro.message);
+            }
+        }
+    }
+});
+
+ipcMain.handle('obter-estado-implantacao-firebird', () => ({
+    papel: tipoBancoAtivo === 'firebird' ? configuracaoFirebirdRuntime?.papel : papelInstalacao,
+    precisaParear: papelInstalacao === 'cliente' && tipoBancoAtivo === 'pareamento',
+    bancoCompartilhado: tipoBancoAtivo === 'firebird'
+}));
+
+ipcMain.handle('parear-estacao-firebird', async (_event, dados = {}) => {
+    if (papelInstalacao !== 'cliente' || tipoBancoAtivo !== 'pareamento') {
+        return { sucesso: false, mensagem: 'Este computador não está aguardando o pareamento com um servidor.' };
+    }
+
+    let firebird;
+    try {
+        const config = await parearComServidor({
+            host: dados.host,
+            portaPareamento: dados.portaPareamento,
+            codigo: dados.codigo,
+            serverId: dados.serverId
+        });
+        firebird = criarConexaoFirebird(config, { limiteConexoes: 8, timeoutMs: 12000 });
+        await obterEstadoInicializacaoFirebird(firebird);
+        configuracaoFirebird.salvarConfiguracao(app.getPath('userData'), safeStorage, config);
+        configuracaoFirebirdRuntime = config;
+        bancoFirebirdRuntime = firebird;
+        acessoBanco = firebird;
+        tipoBancoAtivo = 'firebird';
+        db.close();
+        return { sucesso: true };
+    } catch (erro) {
+        if (firebird && bancoFirebirdRuntime !== firebird) {
+            try { await firebird.fechar(); } catch (_) {}
+        }
+        console.warn('Falha no pareamento da estação Firebird:', erro.message);
+        return { sucesso: false, mensagem: erro.message || 'Não foi possível conectar esta estação ao servidor.' };
+    }
+});
+
+ipcMain.handle('gerar-codigo-pareamento-firebird', async (event) => {
+    const sessao = sessoesGestor.get(event.sender.id);
+    if (tipoBancoAtivo !== 'firebird' || configuracaoFirebirdRuntime?.papel !== 'servidor' || !sessao || sessao.perfil !== 'administrador') {
+        return { sucesso: false, mensagem: 'Somente um administrador conectado ao servidor pode gerar um código de pareamento.' };
+    }
+    if (!servidorPareamentoFirebird) return { sucesso: false, mensagem: 'O serviço de pareamento do servidor não está disponível.' };
+
+    const codigo = servidorPareamentoFirebird.gerarCodigo();
+    await registrarAuditoria(sessao, {
+        acao: 'criar', modulo: 'seguranca', descricao: 'Gerou um código temporário de pareamento para uma estação.',
+        entidade_tipo: 'estacao'
+    });
+    return { sucesso: true, codigo, expiraEmSegundos: 300 };
+});
 
 ipcMain.handle('ativar-licenca', (_event, token) => licenciamento.ativarLicenca(token));
 
@@ -618,7 +791,11 @@ ipcMain.handle('instalar-atualizacao', () => {
 
 ipcMain.handle(
     'login',
-    (event, dados) => {
+    async (event, dados) => {
+
+        if (papelInstalacao === 'cliente' && tipoBancoAtivo !== 'firebird') {
+            return { sucesso: false, mensagem: 'Esta estação precisa ser pareada ao servidor antes do login.' };
+        }
 
         const usuarioInformado = String(dados?.usuario || '').trim();
         const senhaInformada = String(dados?.senha || '');
@@ -630,7 +807,7 @@ ipcMain.handle(
             };
         }
 
-        const usuario = db.prepare(`
+        const usuario = await acessoBanco.consultarUm(`
             SELECT
                 id,
                 nome,
@@ -643,7 +820,7 @@ ipcMain.handle(
             FROM usuarios
             WHERE lower(usuario) = lower(?)
             LIMIT 1
-        `).get(usuarioInformado);
+        `, [usuarioInformado]);
 
         if (!usuario || Number(usuario.ativo) !== 1) {
             return {
@@ -668,13 +845,13 @@ ipcMain.handle(
             };
         }
 
-        db.prepare(`
+        await acessoBanco.executar(`
             UPDATE usuarios
             SET atualizado_em = CURRENT_TIMESTAMP
             WHERE id = ?
-        `).run(usuario.id);
+        `, [usuario.id]);
 
-        registrarAuditoria({
+        await registrarAuditoria({
             id: usuario.id, nome: usuario.nome, usuario: usuario.usuario, perfil: usuario.perfil
         }, {
             acao: 'login', modulo: 'seguranca', descricao: 'Entrou no sistema.'
@@ -708,10 +885,13 @@ let ultimoAgendamentoBackupEmMemoria = '';
 
 // Valores usados quando ainda não há arquivo de configuração de backup.
 function configuracaoBackupPadrao() {
+    const pastaPadrao = tipoBancoAtivo === 'firebird' && configuracaoFirebirdRuntime?.papel === 'servidor'
+        ? path.join(process.env.ProgramData || 'C:\\ProgramData', 'GestorFacil', 'Backups')
+        : path.join(app.getPath('documents'), 'Gestor Fácil', 'Backups');
     return {
         habilitado: false,
         horario: '20:00',
-        pasta: path.join(app.getPath('documents'), 'Gestor Fácil', 'Backups'),
+        pasta: pastaPadrao,
         manter: 7,
         ultimoBackup: '',
         ultimoBackupDataHora: '',
@@ -781,9 +961,9 @@ function validarArquivoBackup(caminho, exigirEsquemaCompleto = false) {
     }
 }
 
-function limparBackupsAntigos(pasta, prefixo, limite) {
+function limparBackupsAntigos(pasta, prefixo, limite, extensao = '.db') {
     const arquivos = fs.readdirSync(pasta)
-        .filter(nome => nome.toLowerCase().startsWith(prefixo) && nome.toLowerCase().endsWith('.db'))
+        .filter(nome => nome.toLowerCase().startsWith(prefixo) && nome.toLowerCase().endsWith(extensao))
         .map(nome => {
             const caminho = path.join(pasta, nome);
             return { caminho, mtime: fs.statSync(caminho).mtimeMs };
@@ -793,14 +973,117 @@ function limparBackupsAntigos(pasta, prefixo, limite) {
     for (const arquivo of arquivos.slice(limite)) fs.unlinkSync(arquivo.caminho);
 }
 
+const TABELAS_IMPORTACAO_INICIAL = [
+    'clientes', 'produtos', 'usuarios', 'permissoes_usuarios', 'vendas', 'itens_venda',
+    'ordens_servico', 'itens_os', 'garantias', 'garantia_itens', 'movimentacoes_estoque', 'auditoria'
+];
+
+function lerPapelInstalacao() {
+    const arquivos = [
+        path.join(process.env.ProgramData || 'C:\\ProgramData', 'GestorFacil', 'implantacao.ini'),
+        path.join(app.getPath('userData'), 'implantacao.ini')
+    ];
+
+    for (const arquivo of arquivos) {
+        try {
+            if (!fs.existsSync(arquivo)) continue;
+            const conteudo = fs.readFileSync(arquivo, 'utf8');
+            const papel = conteudo.match(/^\s*papel\s*=\s*(server|client)\s*$/im)?.[1]?.toLowerCase();
+            if (papel === 'server') return 'servidor';
+            if (papel === 'client') return 'cliente';
+        } catch (_) {
+            // Se uma localização não puder ser lida, tenta a configuração legada do usuário.
+        }
+    }
+    return 'desconhecido';
+}
+
+function contarDadosSqliteLocal() {
+    let total = 0;
+    for (const tabela of TABELAS_IMPORTACAO_INICIAL) {
+        try {
+            total += Number(db.prepare(`SELECT COUNT(*) AS total FROM "${tabela}"`).get()?.total || 0);
+        } catch (_) {
+            // Tabelas opcionais de versões antigas são incluídas no importador
+            // somente se existirem na origem.
+        }
+    }
+    return total;
+}
+
+async function inicializarProvedorBanco() {
+    papelInstalacao = lerPapelInstalacao();
+    const pastaDadosUsuario = app.getPath('userData');
+    const pastasProtegidasPrioritarias = papelInstalacao === 'servidor'
+        ? [path.join(process.env.ProgramData || 'C:\\ProgramData', 'GestorFacil')]
+        : [];
+    const config = configuracaoFirebird.lerConfiguracao(
+        pastaDadosUsuario,
+        safeStorage,
+        { pastasProtegidasPrioritarias }
+    );
+    if (!config) {
+        if (papelInstalacao === 'cliente') {
+            tipoBancoAtivo = 'pareamento';
+            return { tipo: 'pareamento' };
+        }
+        if (papelInstalacao === 'servidor') {
+            throw new Error('A instalação foi definida como servidor, mas a configuração protegida do Firebird não foi encontrada.');
+        }
+        return { tipo: 'sqlite' };
+    }
+
+    const firebird = criarConexaoFirebird(config, { limiteConexoes: 12, timeoutMs: 12000 });
+    try {
+        let estado = await obterEstadoInicializacaoFirebird(firebird);
+
+        // Na primeira abertura do servidor, importa a base local apenas quando
+        // o banco central ainda está vazio. Uma base central já usada nunca é
+        // mesclada nem sobrescrita automaticamente.
+        if (config.papel === 'servidor') {
+            const contagensCentrais = await Promise.all(TABELAS_IMPORTACAO_INICIAL.map(async tabela => {
+                const linha = await firebird.consultarUm(`SELECT COUNT(*) AS total FROM ${tabela}`);
+                return Number(linha?.total || 0);
+            }));
+            const centralVazio = contagensCentrais.every(total => total === 0);
+            const arquivoLocal = path.join(app.getPath('userData'), 'gestor-facil.db');
+            const baseLocalExiste = fs.existsSync(arquivoLocal) && contarDadosSqliteLocal() > 0;
+            if (centralVazio && baseLocalExiste) {
+                await migrarSqliteParaFirebird(arquivoLocal, config);
+                estado = await obterEstadoInicializacaoFirebird(firebird);
+                console.info('A base SQLite local foi importada para o Firebird central; o arquivo original foi preservado.');
+            }
+        }
+
+        tipoBancoAtivo = 'firebird';
+        configuracaoFirebirdRuntime = config;
+        bancoFirebirdRuntime = firebird;
+        acessoBanco = firebird;
+
+        if (config.papel === 'servidor') {
+            servidorPareamentoFirebird = criarServidorPareamento(() => configuracaoFirebirdRuntime);
+            await servidorPareamentoFirebird.iniciar();
+        }
+
+        // A partir deste ponto nenhum handler pode voltar ao SQLite local.
+        // Ele fica fechado para impedir gravações acidentais fora da rede.
+        db.close();
+        return { tipo: 'firebird', estado };
+    } catch (erro) {
+        try { await firebird.fechar(); } catch (_) {}
+        throw erro;
+    }
+}
+
 function nomeBackupAutomatico() {
     const agora = new Date();
     const pad = n => String(n).padStart(2, '0');
-    return `gestor-facil-auto-${agora.getFullYear()}-${pad(agora.getMonth()+1)}-${pad(agora.getDate())}_${pad(agora.getHours())}-${pad(agora.getMinutes())}-${pad(agora.getSeconds())}.db`;
+    return `gestor-facil-auto-${agora.getFullYear()}-${pad(agora.getMonth()+1)}-${pad(agora.getDate())}_${pad(agora.getHours())}-${pad(agora.getMinutes())}-${pad(agora.getSeconds())}.${tipoBancoAtivo === 'firebird' ? 'fbk' : 'db'}`;
 }
 
 // Copia o banco SQLite para a pasta configurada e aplica o nome com data/hora.
 async function executarBackupAutomatico(chaveAgendamento) {
+    if (tipoBancoAtivo === 'pareamento') return { sucesso: false, ignorado: true, motivo: 'estação ainda não conectada ao servidor' };
     if (backupEmExecucao) return { sucesso: false, ignorado: true, motivo: 'backup em andamento' };
     backupEmExecucao = true;
     try {
@@ -809,12 +1092,11 @@ async function executarBackupAutomatico(chaveAgendamento) {
 
         fs.mkdirSync(config.pasta, { recursive: true });
         const destino = path.join(config.pasta, nomeBackupAutomatico());
-        await db.backup(destino);
-        try {
-            validarArquivoBackup(destino, true);
-        } catch (erroValidacao) {
-            try { fs.unlinkSync(destino); } catch (_) {}
-            throw erroValidacao;
+        if (tipoBancoAtivo === 'firebird') await criarBackupFirebird(configuracaoFirebirdRuntime, destino, { validar: true });
+        else {
+            await db.backup(destino);
+            try { validarArquivoBackup(destino, true); }
+            catch (erroValidacao) { try { fs.unlinkSync(destino); } catch (_) {} throw erroValidacao; }
         }
 
         const agora = new Date();
@@ -836,12 +1118,12 @@ async function executarBackupAutomatico(chaveAgendamento) {
 
         // Falhas na retenção não invalidam o backup recém-criado e conferido.
         try {
-            limparBackupsAntigos(config.pasta, 'gestor-facil-auto-', config.manter);
+            limparBackupsAntigos(config.pasta, 'gestor-facil-auto-', config.manter, tipoBancoAtivo === 'firebird' ? '.fbk' : '.db');
         } catch (erroRetencao) {
             console.error('Backup criado e validado, mas não foi possível aplicar a retenção:', erroRetencao);
         }
 
-        registrarAuditoria(null, {
+        await registrarAuditoria(null, {
             acao: 'backup',
             modulo: 'seguranca',
             descricao: `Backup automático realizado: ${path.basename(destino)}.`,
@@ -892,6 +1174,7 @@ async function verificarBackupAutomatico() {
 
 // Verifica periodicamente se chegou o horário definido para o backup automático.
 function iniciarBackupAutomatico() {
+    if (tipoBancoAtivo === 'pareamento') return;
     if (timerBackupAutomatico) {
         clearInterval(timerBackupAutomatico);
         timerBackupAutomatico = null;
@@ -908,6 +1191,7 @@ function iniciarBackupAutomatico() {
 ipcMain.handle('obter-config-backup', () => lerConfiguracaoBackup());
 
 ipcMain.handle('selecionar-pasta-backup', async (event) => {
+    if (tipoBancoAtivo === 'firebird' && configuracaoFirebirdRuntime?.papel !== 'servidor') return { sucesso: false, mensagem: 'Configure os backups no computador servidor.' };
     const janela = BrowserWindow.fromWebContents(event.sender);
     const escolha = await dialog.showOpenDialog(janela, {
         title: 'Escolher pasta para backups automáticos',
@@ -926,9 +1210,9 @@ async function executarBackupAutomaticoForcado() {
         if (!config.pasta) return { sucesso: false, mensagem: 'Configure primeiro a pasta de destino.' };
         fs.mkdirSync(config.pasta, { recursive: true });
         const destino = path.join(config.pasta, nomeBackupAutomatico().replace('gestor-facil-auto-', 'gestor-facil-teste-'));
-        await db.backup(destino);
-        validarArquivoBackup(destino, true);
-        try { limparBackupsAntigos(config.pasta, 'gestor-facil-teste-', 1); }
+        if (tipoBancoAtivo === 'firebird') await criarBackupFirebird(configuracaoFirebirdRuntime, destino, { validar: true });
+        else { await db.backup(destino); validarArquivoBackup(destino, true); }
+        try { limparBackupsAntigos(config.pasta, 'gestor-facil-teste-', 1, tipoBancoAtivo === 'firebird' ? '.fbk' : '.db'); }
         catch (erroRetencao) { console.error('Backup de teste validado, mas não foi possível remover testes antigos:', erroRetencao); }
         return { sucesso: true, caminho: destino, nome_arquivo: path.basename(destino) };
     } catch (erro) {
@@ -939,7 +1223,10 @@ async function executarBackupAutomaticoForcado() {
     }
 }
 
-ipcMain.handle('salvar-config-backup', (event, dados) => {
+ipcMain.handle('salvar-config-backup', async (event, dados) => {
+    if (tipoBancoAtivo === 'pareamento' || (tipoBancoAtivo === 'firebird' && configuracaoFirebirdRuntime?.papel !== 'servidor')) {
+        return { sucesso: false, mensagem: 'Configure o backup automático no computador servidor.' };
+    }
     const sessao = sessoesGestor.get(event.sender.id);
     if (!sessao || sessao.perfil !== 'administrador') return { sucesso: false, mensagem: 'Acesso restrito ao administrador.' };
 
@@ -985,7 +1272,7 @@ ipcMain.handle('salvar-config-backup', (event, dados) => {
         `pasta: ${configAnterior.pasta || 'não definida'} → ${conferida.pasta || 'não definida'}`
     ].join(' | ');
 
-    registrarAuditoria(sessao, {
+    await registrarAuditoria(sessao, {
         acao: 'editar',
         modulo: 'seguranca',
         descricao: descricaoBackup,
@@ -1008,6 +1295,9 @@ ipcMain.handle('salvar-config-backup', (event, dados) => {
 });
 
 ipcMain.handle('testar-backup-automatico', async (event) => {
+    if (tipoBancoAtivo === 'pareamento' || (tipoBancoAtivo === 'firebird' && configuracaoFirebirdRuntime?.papel !== 'servidor')) {
+        return { sucesso: false, mensagem: 'O teste de backup deve ser executado no computador servidor.' };
+    }
     const sessao = sessoesGestor.get(event.sender.id);
     if (!sessao || sessao.perfil !== 'administrador') return { sucesso: false, mensagem: 'Acesso restrito ao administrador.' };
 
@@ -1016,7 +1306,7 @@ ipcMain.handle('testar-backup-automatico', async (event) => {
 
     const resultado = await executarBackupAutomaticoForcado();
     if (resultado?.sucesso) {
-        registrarAuditoria(sessao, { acao: 'backup', modulo: 'seguranca', descricao: `Testou o backup automático: ${resultado.nome_arquivo}.`, entidade_tipo: 'backup' });
+        await registrarAuditoria(sessao, { acao: 'backup', modulo: 'seguranca', descricao: `Testou o backup automático: ${resultado.nome_arquivo}.`, entidade_tipo: 'backup' });
     }
     return resultado;
 });
@@ -1028,19 +1318,23 @@ ipcMain.handle('testar-backup-automatico', async (event) => {
 */
 
 ipcMain.handle('fazer-backup', async (event) => {
+    if (tipoBancoAtivo === 'pareamento' || (tipoBancoAtivo === 'firebird' && configuracaoFirebirdRuntime?.papel !== 'servidor')) {
+        return { sucesso: false, mensagem: 'O backup central deve ser criado no computador servidor.' };
+    }
     if (backupEmExecucao) return { sucesso: false, mensagem: 'Já existe um backup em andamento. Tente novamente em instantes.' };
     backupEmExecucao = true;
     try {
         const agora = new Date();
         const pad = n => String(n).padStart(2, '0');
-        const nomePadrao = `gestor-facil-backup-${agora.getFullYear()}-${pad(agora.getMonth() + 1)}-${pad(agora.getDate())}_${pad(agora.getHours())}-${pad(agora.getMinutes())}-${pad(agora.getSeconds())}.db`;
+        const extensao = tipoBancoAtivo === 'firebird' ? 'fbk' : 'db';
+        const nomePadrao = `gestor-facil-backup-${agora.getFullYear()}-${pad(agora.getMonth() + 1)}-${pad(agora.getDate())}_${pad(agora.getHours())}-${pad(agora.getMinutes())}-${pad(agora.getSeconds())}.${extensao}`;
 
         const janela = BrowserWindow.fromWebContents(event.sender);
         const escolha = await dialog.showSaveDialog(janela, {
             title: 'Salvar backup do Gestor Fácil',
             defaultPath: path.join(app.getPath('documents'), nomePadrao),
             filters: [
-                { name: 'Banco de dados do Gestor Fácil', extensions: ['db'] },
+                { name: 'Backup do Gestor Fácil', extensions: [extensao] },
                 { name: 'Todos os arquivos', extensions: ['*'] }
             ]
         });
@@ -1050,10 +1344,10 @@ ipcMain.handle('fazer-backup', async (event) => {
         }
 
         let destino = escolha.filePath;
-        if (!destino.toLowerCase().endsWith('.db')) destino += '.db';
+        if (!destino.toLowerCase().endsWith(`.${extensao}`)) destino += `.${extensao}`;
 
-        await db.backup(destino);
-        validarArquivoBackup(destino, true);
+        if (tipoBancoAtivo === 'firebird') await criarBackupFirebird(configuracaoFirebirdRuntime, destino, { validar: true });
+        else { await db.backup(destino); validarArquivoBackup(destino, true); }
 
         return {
             sucesso: true,
@@ -1064,7 +1358,9 @@ ipcMain.handle('fazer-backup', async (event) => {
         console.error('Erro ao realizar backup:', erro);
         return {
             sucesso: false,
-            mensagem: 'Não foi possível realizar o backup do banco de dados.'
+            mensagem: tipoBancoAtivo === 'firebird'
+                ? `Não foi possível criar e validar o backup Firebird: ${String(erro.message || erro)}`
+                : 'Não foi possível realizar o backup do banco de dados.'
         };
     } finally {
         backupEmExecucao = false;
@@ -1080,10 +1376,47 @@ ipcMain.handle('fazer-backup', async (event) => {
 
 // A restauração valida e preserva o banco atual antes de substituir o arquivo e reiniciar.
 ipcMain.handle('restaurar-backup', async (event) => {
+    if (tipoBancoAtivo === 'pareamento' || (tipoBancoAtivo === 'firebird' && configuracaoFirebirdRuntime?.papel !== 'servidor')) {
+        return { sucesso: false, mensagem: 'A restauração da base central deve ser executada no computador servidor.' };
+    }
     if (backupEmExecucao) return { sucesso: false, mensagem: 'Aguarde o backup em andamento terminar antes de restaurar.' };
     backupEmExecucao = true;
     try {
         const janela = BrowserWindow.fromWebContents(event.sender);
+        if (tipoBancoAtivo === 'firebird') {
+            const estado = await obterEstadoInicializacaoFirebird(acessoBanco);
+            if (estado?.precisaConfigurarAdministrador) return { sucesso: false, mensagem: 'Configure o administrador do sistema antes de restaurar um backup.' };
+            const escolha = await dialog.showOpenDialog(janela, {
+                title: 'Selecionar backup Firebird do Gestor Fácil', properties: ['openFile'],
+                filters: [{ name: 'Backup Firebird', extensions: ['fbk'] }, { name: 'Todos os arquivos', extensions: ['*'] }]
+            });
+            if (escolha.canceled || !escolha.filePaths?.[0]) return { sucesso: false, cancelado: true };
+            const origem = path.resolve(escolha.filePaths[0]);
+            await validarBackupFirebird(configuracaoFirebirdRuntime, origem);
+
+            const configBackup = lerConfiguracaoBackup();
+            const pastaSeguranca = configBackup.pasta || path.join(app.getPath('documents'), 'Gestor Fácil', 'Backups');
+            fs.mkdirSync(pastaSeguranca, { recursive: true });
+            const agora = new Date();
+            const pad = n => String(n).padStart(2, '0');
+            const nomeSeguranca = `gestor-facil-pre-restauracao-${agora.getFullYear()}-${pad(agora.getMonth()+1)}-${pad(agora.getDate())}_${pad(agora.getHours())}-${pad(agora.getMinutes())}-${pad(agora.getSeconds())}.fbk`;
+            const backupSeguranca = path.join(pastaSeguranca, nomeSeguranca);
+            await criarBackupFirebird(configuracaoFirebirdRuntime, backupSeguranca, { validar: true });
+
+            const bancoAnterior = bancoFirebirdRuntime;
+            try { await bancoAnterior?.fechar(); } catch (_) {}
+            bancoFirebirdRuntime = null;
+            try {
+                await restaurarBackupFirebird(configuracaoFirebirdRuntime, origem, { substituir: true });
+            } catch (erroRestauracao) {
+                bancoFirebirdRuntime = criarConexaoFirebird(configuracaoFirebirdRuntime, { limiteConexoes: 12, timeoutMs: 12000 });
+                acessoBanco = bancoFirebirdRuntime;
+                throw new Error(`A restauração falhou. O backup de segurança foi preservado em ${backupSeguranca}. Feche todas as estações e tente novamente. ${erroRestauracao.message}`);
+            }
+            setTimeout(() => { app.relaunch(); app.exit(0); }, 300);
+            return { sucesso: true, reiniciando: true, backup_seguranca: backupSeguranca, nome_backup_seguranca: path.basename(backupSeguranca) };
+        }
+
         const escolha = await dialog.showOpenDialog(janela, {
             title: 'Selecionar backup do Gestor Fácil',
             properties: ['openFile'],
@@ -1144,7 +1477,9 @@ ipcMain.handle('restaurar-backup', async (event) => {
         console.error('Erro ao restaurar backup:', erro);
         return {
             sucesso: false,
-            mensagem: 'Não foi possível restaurar o backup. O banco atual não foi substituído, se a falha ocorreu antes da restauração.'
+            mensagem: tipoBancoAtivo === 'firebird'
+                ? `Não foi possível restaurar o backup Firebird: ${String(erro.message || erro)}`
+                : 'Não foi possível restaurar o backup. O banco atual não foi substituído, se a falha ocorreu antes da restauração.'
         };
     } finally {
         backupEmExecucao = false;
@@ -1158,8 +1493,10 @@ ipcMain.handle('restaurar-backup', async (event) => {
     ==================================================
 */
 
-app.whenReady().then(() => {
-    iniciarBackupAutomatico();
+app.on('before-quit', () => {
+    anunciadorFirebird?.fechar().catch(erro => console.error('Falha ao encerrar anúncio Firebird:', erro));
+    servidorPareamentoFirebird?.fechar().catch(erro => console.error('Falha ao encerrar pareamento Firebird:', erro));
+    bancoFirebirdRuntime?.fechar().catch(erro => console.error('Falha ao encerrar pool Firebird:', erro));
 });
 
 // Cria a janela principal com preload e isolamento de contexto habilitados.
@@ -1217,19 +1554,12 @@ function criarJanela() {
 
 ipcMain.handle(
     'listar-produtos',
-    () => {
-
-        const produtos = db
-            .prepare(`
-                SELECT *
-                FROM produtos
-                ORDER BY id DESC
-            `)
-            .all();
-
-
-        return produtos;
-
+    async () => {
+        return acessoBanco.consultar(`
+            SELECT *
+            FROM produtos
+            ORDER BY id DESC
+        `);
     }
 );
 
@@ -1240,12 +1570,9 @@ ipcMain.handle(
 
 ipcMain.handle(
     'cadastrar-produto',
-    (event, produto) => {
-
-        const comando = db.prepare(`
-
+    async (event, produto) => {
+        const resultado = await acessoBanco.executar(`
             INSERT INTO produtos (
-
                 nome,
                 codigo,
                 sku,
@@ -1255,67 +1582,22 @@ ipcMain.handle(
                 preco_venda,
                 estoque,
                 estoque_minimo
-
-            )
-
-            VALUES (
-
-                @nome,
-                @codigo,
-                @sku,
-                @codigo_barras,
-                @categoria,
-                @preco_custo,
-                @preco_venda,
-                @estoque,
-                @estoque_minimo
-
-            )
-
-        `);
-
-
-        const resultado = comando.run({
-
-            nome:
-                produto.nome,
-
-            codigo:
-                produto.codigo || null,
-
-            sku:
-                produto.sku || null,
-
-            codigo_barras:
-                produto.codigo_barras || null,
-
-            categoria:
-                produto.categoria || null,
-
-            preco_custo:
-                Number(produto.preco_custo) || 0,
-
-            preco_venda:
-                Number(produto.preco_venda) || 0,
-
-            estoque:
-                Number(produto.estoque) || 0,
-
-            estoque_minimo:
-                Number(produto.estoque_minimo) || 0
-
-        });
-
-
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+            produto.nome,
+            produto.codigo || null,
+            produto.sku || null,
+            produto.codigo_barras || null,
+            produto.categoria || null,
+            Number(produto.preco_custo) || 0,
+            Number(produto.preco_venda) || 0,
+            Number(produto.estoque) || 0,
+            Number(produto.estoque_minimo) || 0
+        ]);
         return {
-
             sucesso: true,
-
-            id:
-                resultado.lastInsertRowid
-
+            id: resultado.lastInsertRowid
         };
-
     }
 );
 
@@ -1326,79 +1608,27 @@ ipcMain.handle(
 
 ipcMain.handle(
     'editar-produto',
-    (event, produto) => {
-
-        const comando = db.prepare(`
-
+    async (event, produto) => {
+        const resultado = await acessoBanco.executar(`
             UPDATE produtos
-
-            SET
-
-                nome = @nome,
-
-                codigo = @codigo,
-
-                sku = @sku,
-
-                codigo_barras = @codigo_barras,
-
-                categoria = @categoria,
-
-                preco_custo = @preco_custo,
-
-                preco_venda = @preco_venda,
-
-                estoque = @estoque,
-
-                estoque_minimo = @estoque_minimo
-
-            WHERE id = @id
-
-        `);
-
-
-        const resultado = comando.run({
-
-            id:
-                produto.id,
-
-            nome:
-                produto.nome,
-
-            codigo:
-                produto.codigo || null,
-
-            sku:
-                produto.sku || null,
-
-            codigo_barras:
-                produto.codigo_barras || null,
-
-            categoria:
-                produto.categoria || null,
-
-            preco_custo:
-                Number(produto.preco_custo) || 0,
-
-            preco_venda:
-                Number(produto.preco_venda) || 0,
-
-            estoque:
-                Number(produto.estoque) || 0,
-
-            estoque_minimo:
-                Number(produto.estoque_minimo) || 0
-
-        });
-
-
+            SET nome = ?, codigo = ?, sku = ?, codigo_barras = ?, categoria = ?,
+                preco_custo = ?, preco_venda = ?, estoque = ?, estoque_minimo = ?
+            WHERE id = ?
+        `, [
+            produto.nome,
+            produto.codigo || null,
+            produto.sku || null,
+            produto.codigo_barras || null,
+            produto.categoria || null,
+            Number(produto.preco_custo) || 0,
+            Number(produto.preco_venda) || 0,
+            Number(produto.estoque) || 0,
+            Number(produto.estoque_minimo) || 0,
+            produto.id
+        ]);
         return {
-
-            sucesso:
-                resultado.changes > 0
-
+            sucesso: resultado.changes > 0
         };
-
     }
 );
 
@@ -1409,7 +1639,7 @@ ipcMain.handle(
 
 ipcMain.handle(
     'excluir-produto',
-    (event, id) => {
+    async (event, id) => {
 
         const produtoId = Number(id);
 
@@ -1421,13 +1651,12 @@ ipcMain.handle(
         }
 
         try {
-            const executar = db.transaction(() => {
-
-                const produto = db.prepare(`
+            const produtoRemovido = await acessoBanco.transacao(async banco => {
+                const produto = await banco.consultarUm(`
                     SELECT id, nome
                     FROM produtos
                     WHERE id = ?
-                `).get(produtoId);
+                `, [produtoId]);
 
                 if (!produto) {
                     throw new Error('Produto não encontrado.');
@@ -1444,24 +1673,24 @@ ipcMain.handle(
 
                 // 1) Garantias: remove o produto das garantias com múltiplos
                 // itens e remove a garantia antiga quando ela fica sem item.
-                const garantiasAfetadas = db.prepare(`
+                const garantiasAfetadas = await banco.consultar(`
                     SELECT DISTINCT garantia_id
                     FROM garantia_itens
                     WHERE produto_id = ?
-                `).all(produtoId);
+                `, [produtoId]);
 
-                db.prepare(`
+                await banco.executar(`
                     DELETE FROM garantia_itens
                     WHERE produto_id = ?
-                `).run(produtoId);
+                `, [produtoId]);
 
-                db.prepare(`
+                await banco.executar(`
                     UPDATE garantias
                     SET produto_id = NULL
                     WHERE produto_id = ?
-                `).run(produtoId);
+                `, [produtoId]);
 
-                const apagarGarantiaVazia = db.prepare(`
+                const apagarGarantiaVazia = `
                     DELETE FROM garantias
                     WHERE id = ?
                       AND produto_id IS NULL
@@ -1470,82 +1699,84 @@ ipcMain.handle(
                           FROM garantia_itens gi
                           WHERE gi.garantia_id = garantias.id
                       )
-                `);
+                `;
 
                 for (const garantia of garantiasAfetadas) {
-                    apagarGarantiaVazia.run(Number(garantia.garantia_id));
+                    await banco.executar(apagarGarantiaVazia, [Number(garantia.garantia_id)]);
                 }
 
                 // 2) Ordens de serviço: remove somente as peças deste
                 // produto e recalcula os valores das OS afetadas.
-                const osAfetadas = db.prepare(`
+                const osAfetadas = await banco.consultar(`
                     SELECT DISTINCT os_id
                     FROM itens_os
                     WHERE produto_id = ?
-                `).all(produtoId);
+                `, [produtoId]);
 
-                db.prepare(`
+                await banco.executar(`
                     DELETE FROM itens_os
                     WHERE produto_id = ?
-                `).run(produtoId);
+                `, [produtoId]);
 
-                const recalcularOS = db.prepare(`
+                const recalcularOS = `
                     SELECT
                         COALESCE(SUM(subtotal), 0) AS valor_pecas
                     FROM itens_os
                     WHERE os_id = ?
-                `);
+                `;
 
-                const atualizarOS = db.prepare(`
+                const atualizarOS = `
                     UPDATE ordens_servico
                     SET
                         valor_pecas = ?,
-                        total = MAX(0, ? + COALESCE(valor_mao_obra, 0) - COALESCE(desconto, 0))
+                        total = ?
                     WHERE id = ?
-                `);
+                `;
 
                 for (const os of osAfetadas) {
-                    const valores = recalcularOS.get(Number(os.os_id));
+                    const valores = await banco.consultarUm(recalcularOS, [Number(os.os_id)]);
                     const valorPecas = Number(valores?.valor_pecas || 0);
-                    atualizarOS.run(valorPecas, valorPecas, Number(os.os_id));
+                    const atual = await banco.consultarUm('SELECT valor_mao_obra, desconto FROM ordens_servico WHERE id = ?', [Number(os.os_id)]);
+                    const total = Math.max(0, valorPecas + Number(atual?.valor_mao_obra || 0) - Number(atual?.desconto || 0));
+                    await banco.executar(atualizarOS, [valorPecas, total, Number(os.os_id)]);
                 }
 
                 // 3) Vendas: remove o item do produto do histórico.
                 // Se aquela venda não tiver mais nenhum item, a venda inteira
                 // é removida para não deixar uma venda vazia no histórico.
-                const vendasAfetadas = db.prepare(`
+                const vendasAfetadas = await banco.consultar(`
                     SELECT DISTINCT venda_id
                     FROM itens_venda
                     WHERE produto_id = ?
-                `).all(produtoId);
+                `, [produtoId]);
 
-                db.prepare(`
+                await banco.executar(`
                     DELETE FROM itens_venda
                     WHERE produto_id = ?
-                `).run(produtoId);
+                `, [produtoId]);
 
-                const contarItensVenda = db.prepare(`
+                const contarItensVenda = `
                     SELECT COUNT(*) AS quantidade
                     FROM itens_venda
                     WHERE venda_id = ?
-                `);
+                `;
 
-                const recalcularVenda = db.prepare(`
+                const recalcularVenda = `
                     SELECT COALESCE(SUM(subtotal), 0) AS subtotal
                     FROM itens_venda
                     WHERE venda_id = ?
-                `);
+                `;
 
-                const atualizarVenda = db.prepare(`
+                const atualizarVenda = `
                     UPDATE vendas
                     SET
                         subtotal = ?,
-                        desconto = MIN(COALESCE(desconto, 0), ?),
-                        total = ? - MIN(COALESCE(desconto, 0), ?)
+                        desconto = ?,
+                        total = ?
                     WHERE id = ?
-                `);
+                `;
 
-                const apagarVendaVazia = db.prepare(`
+                const apagarVendaVazia = `
                     DELETE FROM vendas
                     WHERE id = ?
                       AND NOT EXISTS (
@@ -1553,33 +1784,35 @@ ipcMain.handle(
                           FROM itens_venda iv
                           WHERE iv.venda_id = vendas.id
                       )
-                `);
+                `;
 
                 for (const venda of vendasAfetadas) {
                     const vendaId = Number(venda.venda_id);
-                    const quantidadeItens = Number(contarItensVenda.get(vendaId)?.quantidade || 0);
+                    const quantidadeItens = Number((await banco.consultarUm(contarItensVenda, [vendaId]))?.quantidade || 0);
 
                     if (quantidadeItens === 0) {
                         // ON DELETE CASCADE remove garantias ligadas à venda.
-                        apagarVendaVazia.run(vendaId);
+                        await banco.executar(apagarVendaVazia, [vendaId]);
                         continue;
                     }
 
-                    const subtotal = Number(recalcularVenda.get(vendaId)?.subtotal || 0);
-                    atualizarVenda.run(subtotal, subtotal, subtotal, subtotal, vendaId);
+                    const subtotal = Number((await banco.consultarUm(recalcularVenda, [vendaId]))?.subtotal || 0);
+                    const atual = await banco.consultarUm('SELECT desconto FROM vendas WHERE id = ?', [vendaId]);
+                    const desconto = Math.min(Number(atual?.desconto || 0), subtotal);
+                    await banco.executar(atualizarVenda, [subtotal, desconto, subtotal - desconto, vendaId]);
                 }
 
                 // 4) Histórico de movimentações de estoque do produto.
-                db.prepare(`
+                await banco.executar(`
                     DELETE FROM movimentacoes_estoque
                     WHERE produto_id = ?
-                `).run(produtoId);
+                `, [produtoId]);
 
                 // 5) Por último, exclui o cadastro do produto.
-                const resultado = db.prepare(`
+                const resultado = await banco.executar(`
                     DELETE FROM produtos
                     WHERE id = ?
-                `).run(produtoId);
+                `, [produtoId]);
 
                 if (resultado.changes !== 1) {
                     throw new Error('O produto não foi excluído.');
@@ -1591,12 +1824,10 @@ ipcMain.handle(
                 };
             });
 
-            const resultadoExecucao = executar();
-
             return {
                 sucesso: true,
-                id: resultadoExecucao.id,
-                nome: resultadoExecucao.nome
+                id: produtoRemovido.id,
+                nome: produtoRemovido.nome
             };
 
         } catch (erro) {
@@ -1625,19 +1856,12 @@ ipcMain.handle(
 
 ipcMain.handle(
     'listar-clientes',
-    () => {
-
-        const clientes = db
-            .prepare(`
-                SELECT *
-                FROM clientes
-                ORDER BY id DESC
-            `)
-            .all();
-
-
-        return clientes;
-
+    async () => {
+        return acessoBanco.consultar(`
+            SELECT *
+            FROM clientes
+            ORDER BY id DESC
+        `);
     }
 );
 
@@ -1648,19 +1872,12 @@ ipcMain.handle(
 
 ipcMain.handle(
     'buscar-cliente',
-    (event, id) => {
-
-        const cliente = db
-            .prepare(`
-                SELECT *
-                FROM clientes
-                WHERE id = ?
-            `)
-            .get(id);
-
-
-        return cliente || null;
-
+    async (event, id) => {
+        return acessoBanco.consultarUm(`
+            SELECT *
+            FROM clientes
+            WHERE id = ?
+        `, [id]);
     }
 );
 
@@ -1671,12 +1888,9 @@ ipcMain.handle(
 
 ipcMain.handle(
     'cadastrar-cliente',
-    (event, cliente) => {
-
-        const comando = db.prepare(`
-
+    async (event, cliente) => {
+        const resultado = await acessoBanco.executar(`
             INSERT INTO clientes (
-
                 nome,
                 cpf_cnpj,
                 telefone,
@@ -1690,83 +1904,26 @@ ipcMain.handle(
                 cidade,
                 estado,
                 observacoes
-
-            )
-
-            VALUES (
-
-                @nome,
-                @cpf_cnpj,
-                @telefone,
-                @celular,
-                @email,
-                @cep,
-                @endereco,
-                @numero,
-                @complemento,
-                @bairro,
-                @cidade,
-                @estado,
-                @observacoes
-
-            )
-
-        `);
-
-
-        const resultado = comando.run({
-
-            nome:
-                cliente.nome,
-
-            cpf_cnpj:
-                cliente.cpf_cnpj || null,
-
-            telefone:
-                cliente.telefone || null,
-
-            celular:
-                cliente.celular || null,
-
-            email:
-                cliente.email || null,
-
-            cep:
-                cliente.cep || null,
-
-            endereco:
-                cliente.endereco || null,
-
-            numero:
-                cliente.numero || null,
-
-            complemento:
-                cliente.complemento || null,
-
-            bairro:
-                cliente.bairro || null,
-
-            cidade:
-                cliente.cidade || null,
-
-            estado:
-                cliente.estado || null,
-
-            observacoes:
-                cliente.observacoes || null
-
-        });
-
-
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+            cliente.nome,
+            cliente.cpf_cnpj || null,
+            cliente.telefone || null,
+            cliente.celular || null,
+            cliente.email || null,
+            cliente.cep || null,
+            cliente.endereco || null,
+            cliente.numero || null,
+            cliente.complemento || null,
+            cliente.bairro || null,
+            cliente.cidade || null,
+            cliente.estado || null,
+            cliente.observacoes || null
+        ]);
         return {
-
             sucesso: true,
-
-            id:
-                resultado.lastInsertRowid
-
+            id: resultado.lastInsertRowid
         };
-
     }
 );
 
@@ -1777,99 +1934,32 @@ ipcMain.handle(
 
 ipcMain.handle(
     'editar-cliente',
-    (event, cliente) => {
-
-        const comando = db.prepare(`
-
+    async (event, cliente) => {
+        const resultado = await acessoBanco.executar(`
             UPDATE clientes
-
-            SET
-
-                nome = @nome,
-
-                cpf_cnpj = @cpf_cnpj,
-
-                telefone = @telefone,
-
-                celular = @celular,
-
-                email = @email,
-
-                cep = @cep,
-
-                endereco = @endereco,
-
-                numero = @numero,
-
-                complemento = @complemento,
-
-                bairro = @bairro,
-
-                cidade = @cidade,
-
-                estado = @estado,
-
-                observacoes = @observacoes
-
-            WHERE id = @id
-
-        `);
-
-
-        const resultado = comando.run({
-
-            id:
-                cliente.id,
-
-            nome:
-                cliente.nome,
-
-            cpf_cnpj:
-                cliente.cpf_cnpj || null,
-
-            telefone:
-                cliente.telefone || null,
-
-            celular:
-                cliente.celular || null,
-
-            email:
-                cliente.email || null,
-
-            cep:
-                cliente.cep || null,
-
-            endereco:
-                cliente.endereco || null,
-
-            numero:
-                cliente.numero || null,
-
-            complemento:
-                cliente.complemento || null,
-
-            bairro:
-                cliente.bairro || null,
-
-            cidade:
-                cliente.cidade || null,
-
-            estado:
-                cliente.estado || null,
-
-            observacoes:
-                cliente.observacoes || null
-
-        });
-
-
+            SET nome = ?, cpf_cnpj = ?, telefone = ?, celular = ?, email = ?,
+                cep = ?, endereco = ?, numero = ?, complemento = ?, bairro = ?,
+                cidade = ?, estado = ?, observacoes = ?
+            WHERE id = ?
+        `, [
+            cliente.nome,
+            cliente.cpf_cnpj || null,
+            cliente.telefone || null,
+            cliente.celular || null,
+            cliente.email || null,
+            cliente.cep || null,
+            cliente.endereco || null,
+            cliente.numero || null,
+            cliente.complemento || null,
+            cliente.bairro || null,
+            cliente.cidade || null,
+            cliente.estado || null,
+            cliente.observacoes || null,
+            cliente.id
+        ]);
         return {
-
-            sucesso:
-                resultado.changes > 0
-
+            sucesso: resultado.changes > 0
         };
-
     }
 );
 
@@ -1880,27 +1970,14 @@ ipcMain.handle(
 
 ipcMain.handle(
     'excluir-cliente',
-    (event, id) => {
-
-        const comando = db.prepare(`
-
+    async (event, id) => {
+        const resultado = await acessoBanco.executar(`
             DELETE FROM clientes
-
             WHERE id = ?
-
-        `);
-
-
-        const resultado = comando.run(id);
-
-
+        `, [id]);
         return {
-
-            sucesso:
-                resultado.changes > 0
-
+            sucesso: resultado.changes > 0
         };
-
     }
 );
 
@@ -1916,7 +1993,7 @@ ipcMain.handle(
 
 ipcMain.handle(
     'entrada-estoque',
-    (event, dados) => {
+    async (event, dados) => {
 
         try {
 
@@ -1945,13 +2022,12 @@ ipcMain.handle(
                 };
             }
 
-            const executar = db.transaction(() => {
-
-                const produto = db.prepare(`
+            const movimento = await acessoBanco.transacao(async banco => {
+                const produto = await banco.consultarUm(`
                     SELECT id, nome, estoque
                     FROM produtos
                     WHERE id = ?
-                `).get(produtoId);
+                `, [produtoId]);
 
                 if (!produto) {
                     throw new Error('Produto não encontrado.');
@@ -1960,16 +2036,16 @@ ipcMain.handle(
                 const estoqueAnterior = Number(produto.estoque) || 0;
                 const estoquePosterior = estoqueAnterior + quantidade;
 
-                db.prepare(`
+                await banco.executar(`
                     UPDATE produtos
                     SET estoque = ?
                     WHERE id = ?
-                `).run(
+                `, [
                     estoquePosterior,
                     produtoId
-                );
+                ]);
 
-                const resultado = db.prepare(`
+                const resultado = await banco.executar(`
                     INSERT INTO movimentacoes_estoque (
                         produto_id,
                         tipo,
@@ -1981,13 +2057,13 @@ ipcMain.handle(
                     ) VALUES (
                         ?, 'entrada', ?, ?, ?, ?, 'manual'
                     )
-                `).run(
+                `, [
                     produtoId,
                     quantidade,
                     estoqueAnterior,
                     estoquePosterior,
                     motivo
-                );
+                ]);
 
                 return {
                     id: Number(resultado.lastInsertRowid),
@@ -1998,8 +2074,6 @@ ipcMain.handle(
                     estoque_posterior: estoquePosterior
                 };
             });
-
-            const movimento = executar();
 
             return {
                 sucesso: true,
@@ -2026,7 +2100,7 @@ ipcMain.handle(
 
 ipcMain.handle(
     'saida-estoque',
-    (event, dados) => {
+    async (event, dados) => {
 
         try {
 
@@ -2055,13 +2129,12 @@ ipcMain.handle(
                 };
             }
 
-            const executar = db.transaction(() => {
-
-                const produto = db.prepare(`
+            const movimento = await acessoBanco.transacao(async banco => {
+                const produto = await banco.consultarUm(`
                     SELECT id, nome, estoque
                     FROM produtos
                     WHERE id = ?
-                `).get(produtoId);
+                `, [produtoId]);
 
                 if (!produto) {
                     throw new Error('Produto não encontrado.');
@@ -2075,16 +2148,16 @@ ipcMain.handle(
 
                 const estoquePosterior = estoqueAnterior - quantidade;
 
-                db.prepare(`
+                await banco.executar(`
                     UPDATE produtos
                     SET estoque = ?
                     WHERE id = ?
-                `).run(
+                `, [
                     estoquePosterior,
                     produtoId
-                );
+                ]);
 
-                const resultado = db.prepare(`
+                const resultado = await banco.executar(`
                     INSERT INTO movimentacoes_estoque (
                         produto_id,
                         tipo,
@@ -2096,13 +2169,13 @@ ipcMain.handle(
                     ) VALUES (
                         ?, 'saida', ?, ?, ?, ?, 'manual'
                     )
-                `).run(
+                `, [
                     produtoId,
                     quantidade,
                     estoqueAnterior,
                     estoquePosterior,
                     motivo
-                );
+                ]);
 
                 return {
                     id: Number(resultado.lastInsertRowid),
@@ -2113,8 +2186,6 @@ ipcMain.handle(
                     estoque_posterior: estoquePosterior
                 };
             });
-
-            const movimento = executar();
 
             return {
                 sucesso: true,
@@ -2142,7 +2213,7 @@ ipcMain.handle(
 // Ajusta o saldo para a quantidade física informada e registra a movimentação.
 ipcMain.handle(
     'ajuste-estoque',
-    (event, dados) => {
+    async (event, dados) => {
 
         try {
             const produtoId = Number(dados?.produto_id);
@@ -2161,12 +2232,12 @@ ipcMain.handle(
                 return { sucesso: false, mensagem: 'Informe o motivo do ajuste.' };
             }
 
-            const executar = db.transaction(() => {
-                const produto = db.prepare(`
+            const movimento = await acessoBanco.transacao(async banco => {
+                const produto = await banco.consultarUm(`
                     SELECT id, nome, estoque
                     FROM produtos
                     WHERE id = ?
-                `).get(produtoId);
+                `, [produtoId]);
 
                 if (!produto) {
                     throw new Error('Produto não encontrado.');
@@ -2175,13 +2246,13 @@ ipcMain.handle(
                 const estoqueAnterior = Number(produto.estoque) || 0;
                 const diferenca = quantidadeFisica - estoqueAnterior;
 
-                db.prepare(`
+                await banco.executar(`
                     UPDATE produtos
                     SET estoque = ?
                     WHERE id = ?
-                `).run(quantidadeFisica, produtoId);
+                `, [quantidadeFisica, produtoId]);
 
-                const insercao = db.prepare(`
+                const insercao = await banco.executar(`
                     INSERT INTO movimentacoes_estoque (
                         produto_id,
                         tipo,
@@ -2191,13 +2262,13 @@ ipcMain.handle(
                         motivo,
                         origem
                     ) VALUES (?, 'ajuste', ?, ?, ?, ?, 'manual')
-                `).run(
+                `, [
                     produtoId,
                     Math.abs(diferenca),
                     estoqueAnterior,
                     quantidadeFisica,
                     motivo
-                );
+                ]);
 
                 return {
                     id: Number(insercao.lastInsertRowid),
@@ -2209,7 +2280,7 @@ ipcMain.handle(
                 };
             });
 
-            return { sucesso: true, ...executar() };
+            return { sucesso: true, ...movimento };
         } catch (erro) {
             console.error('Erro ao registrar ajuste de estoque:', erro);
             return {
@@ -2223,9 +2294,8 @@ ipcMain.handle(
 
 ipcMain.handle(
     'listar-movimentacoes-estoque',
-    () => {
-
-        return db.prepare(`
+    async () => {
+        return acessoBanco.consultar(`
             SELECT
                 movimentacoes_estoque.*,
                 produtos.nome AS produto_nome,
@@ -2235,8 +2305,7 @@ ipcMain.handle(
             INNER JOIN produtos
                 ON produtos.id = movimentacoes_estoque.produto_id
             ORDER BY movimentacoes_estoque.id DESC
-        `).all();
-
+        `);
     }
 );
 
@@ -2249,17 +2318,12 @@ ipcMain.handle(
 
 
 // Número sequencial apresentado nas telas; não substitui a chave interna do banco.
-function proximoNumeroOS() {
-
-    const resultado = db
-        .prepare(`
+async function proximoNumeroOS(banco = acessoBanco) {
+    const resultado = await banco.consultarUm(`
             SELECT COALESCE(MAX(numero), 0) + 1 AS proximo_numero
             FROM ordens_servico
-        `)
-        .get();
-
+        `);
     return Number(resultado.proximo_numero) || 1;
-
 }
 
 
@@ -2288,9 +2352,8 @@ function normalizarItensOS(itens) {
 
 ipcMain.handle(
     'listar-ordens-servico',
-    () => {
-
-        return db.prepare(`
+    async () => {
+        return acessoBanco.consultar(`
             SELECT
                 ordens_servico.*,
                 clientes.nome AS cliente_nome,
@@ -2299,17 +2362,16 @@ ipcMain.handle(
             LEFT JOIN clientes
                 ON clientes.id = ordens_servico.cliente_id
             ORDER BY ordens_servico.id DESC
-        `).all();
-
+        `);
     }
 );
 
 
 ipcMain.handle(
     'buscar-ordem-servico',
-    (event, id) => {
+    async (event, id) => {
 
-        const os = db.prepare(`
+        const os = await acessoBanco.consultarUm(`
             SELECT
                 ordens_servico.*,
                 clientes.nome AS cliente_nome,
@@ -2321,13 +2383,13 @@ ipcMain.handle(
             LEFT JOIN clientes
                 ON clientes.id = ordens_servico.cliente_id
             WHERE ordens_servico.id = ?
-        `).get(id);
+        `, [id]);
 
         if (!os) {
             return null;
         }
 
-        os.itens_os = db.prepare(`
+        os.itens_os = await acessoBanco.consultar(`
             SELECT
                 itens_os.id,
                 itens_os.os_id,
@@ -2343,7 +2405,7 @@ ipcMain.handle(
                 ON produtos.id = itens_os.produto_id
             WHERE itens_os.os_id = ?
             ORDER BY itens_os.id ASC
-        `).all(id);
+        `, [id]);
 
         return os;
 
@@ -2353,7 +2415,7 @@ ipcMain.handle(
 
 ipcMain.handle(
     'cadastrar-ordem-servico',
-    (event, os) => {
+    async (event, os) => {
 
         try {
 
@@ -2372,17 +2434,17 @@ ipcMain.handle(
             }
 
             const itens = normalizarItensOS(os.itens_pecas);
-            const numero = proximoNumeroOS();
+            const numero = await proximoNumeroOS();
 
-            const executar = db.transaction(() => {
+            const resultadoExecucao = await acessoBanco.transacao(async banco => {
 
                 for (const item of itens) {
 
-                    const produto = db.prepare(`
+                    const produto = await banco.consultarUm(`
                         SELECT id, nome, estoque, preco_venda
                         FROM produtos
                         WHERE id = ?
-                    `).get(item.produto_id);
+                    `, [item.produto_id]);
 
                     if (!produto) {
                         throw new Error(`Produto não encontrado: ${item.produto_id}`);
@@ -2399,7 +2461,7 @@ ipcMain.handle(
                     item.subtotal = item.valor_unitario * item.quantidade;
                 }
 
-                const resultado = db.prepare(`
+                const resultado = await banco.executar(`
                     INSERT INTO ordens_servico (
                         numero,
                         cliente_id,
@@ -2449,7 +2511,7 @@ ipcMain.handle(
                         @total,
                         @observacoes
                     )
-                `).run({
+                `, {
                     numero,
                     cliente_id: Number(os.cliente_id),
                     tipo_equipamento: os.tipo_equipamento.trim(),
@@ -2475,9 +2537,17 @@ ipcMain.handle(
                     observacoes: os.observacoes || null
                 });
 
-                const osId = Number(resultado.lastInsertRowid);
+                // node-firebird executa o INSERT, mas executeAsync não entrega
+                // a linha de RETURNING. Recupere a chave pela numeração única
+                // da OS dentro da própria transação antes de gravar suas peças.
+                const osGravadaNaTransacao = await banco.consultarUm(
+                    'SELECT id FROM ordens_servico WHERE numero = ?',
+                    [numero]
+                );
+                const osId = Number(osGravadaNaTransacao?.id || resultado.lastInsertRowid || 0);
+                if (!osId) throw new Error('A OS foi inserida, mas não foi possível obter seu identificador.');
 
-                const inserirItem = db.prepare(`
+                const inserirItem = `
                     INSERT INTO itens_os (
                         os_id,
                         produto_id,
@@ -2495,21 +2565,15 @@ ipcMain.handle(
                         @valor_unitario,
                         @subtotal
                     )
-                `);
+                `;
 
-                const buscarEstoqueAtual = db.prepare(`
-                    SELECT estoque
-                    FROM produtos
-                    WHERE id = ?
-                `);
-
-                const baixarEstoque = db.prepare(`
+                const baixarEstoque = `
                     UPDATE produtos
                     SET estoque = estoque - @quantidade
                     WHERE id = @produto_id
-                `);
+                `;
 
-                const registrarMovimentacao = db.prepare(`
+                const registrarMovimentacao = `
                     INSERT INTO movimentacoes_estoque (
                         produto_id,
                         tipo,
@@ -2529,10 +2593,10 @@ ipcMain.handle(
                         'os',
                         @origem_id
                     )
-                `);
+                `;
 
                 for (const item of itens) {
-                    inserirItem.run({
+                    await banco.executar(inserirItem, {
                         os_id: osId,
                         produto_id: item.produto_id,
                         descricao: item.descricao,
@@ -2542,18 +2606,18 @@ ipcMain.handle(
                         subtotal: item.subtotal
                     });
 
-                    const estoqueAnterior = Number(
-                        buscarEstoqueAtual.get(item.produto_id)?.estoque || 0
-                    );
+                    const estoqueAnterior = Number((await banco.consultarUm(
+                        'SELECT estoque FROM produtos WHERE id = ?', [item.produto_id]
+                    ))?.estoque || 0);
 
-                    baixarEstoque.run({
+                    await banco.executar(baixarEstoque, {
                         produto_id: item.produto_id,
                         quantidade: item.quantidade
                     });
 
                     const estoquePosterior = estoqueAnterior - Number(item.quantidade);
 
-                    registrarMovimentacao.run({
+                    await banco.executar(registrarMovimentacao, {
                         produto_id: Number(item.produto_id),
                         quantidade: Number(item.quantidade),
                         estoque_anterior: estoqueAnterior,
@@ -2581,17 +2645,13 @@ ipcMain.handle(
                 };
             });
 
-            // Executa de fato a transação.
-            // Antes, db.transaction(...) era criada, mas não era chamada.
-            const resultadoExecucao = executar();
-
             // Busca novamente os dados gravados no banco para garantir
             // que o número exibido seja exatamente o número persistido.
-            const osGravada = db.prepare(`
+            const osGravada = await acessoBanco.consultarUm(`
                 SELECT id, numero
                 FROM ordens_servico
                 WHERE id = ?
-            `).get(resultadoExecucao.id);
+            `, [resultadoExecucao.id]);
 
             return {
                 sucesso: true,
@@ -2626,7 +2686,7 @@ ipcMain.handle(
 
 ipcMain.handle(
     'editar-ordem-servico',
-    (event, os) => {
+    async (event, os) => {
 
         try {
 
@@ -2636,37 +2696,37 @@ ipcMain.handle(
 
             const itensNovos = normalizarItensOS(os.itens_pecas);
 
-            const executar = db.transaction(() => {
+            const sucessoEdicao = await acessoBanco.transacao(async banco => {
 
-                const atual = db.prepare(`
+                const atual = await banco.consultarUm(`
                     SELECT id, numero, valor_pecas
                     FROM ordens_servico
                     WHERE id = ?
-                `).get(os.id);
+                `, [os.id]);
 
                 if (!atual) {
                     throw new Error('Ordem de serviço não encontrada.');
                 }
 
-                const itensAntigos = db.prepare(`
+                const itensAntigos = await banco.consultar(`
                     SELECT produto_id, quantidade
                     FROM itens_os
                     WHERE os_id = ?
-                `).all(os.id);
+                `, [os.id]);
 
-                const buscarEstoqueAtual = db.prepare(`
+                const buscarEstoqueAtual = `
                     SELECT id, nome, estoque, preco_venda
                     FROM produtos
                     WHERE id = ?
-                `);
+                `;
 
-                const atualizarEstoque = db.prepare(`
+                const atualizarEstoque = `
                     UPDATE produtos
                     SET estoque = ?
                     WHERE id = ?
-                `);
+                `;
 
-                const registrarMovimentacao = db.prepare(`
+                const registrarMovimentacao = `
                     INSERT INTO movimentacoes_estoque (
                         produto_id,
                         tipo,
@@ -2686,14 +2746,14 @@ ipcMain.handle(
                         'os',
                         @origem_id
                     )
-                `);
+                `;
 
                 // Devolve ao estoque as peças da versão anterior da OS.
                 for (const item of itensAntigos) {
 
                     if (!item.produto_id) continue;
 
-                    const produto = buscarEstoqueAtual.get(item.produto_id);
+                    const produto = await banco.consultarUm(buscarEstoqueAtual, [item.produto_id]);
 
                     if (!produto) {
                         throw new Error(`Produto não encontrado: ${item.produto_id}`);
@@ -2703,12 +2763,12 @@ ipcMain.handle(
                     const estoqueAnterior = Number(produto.estoque) || 0;
                     const estoquePosterior = estoqueAnterior + quantidade;
 
-                    atualizarEstoque.run(
+                    await banco.executar(atualizarEstoque, [
                         estoquePosterior,
                         Number(item.produto_id)
-                    );
+                    ]);
 
-                    registrarMovimentacao.run({
+                    await banco.executar(registrarMovimentacao, {
                         produto_id: Number(item.produto_id),
                         tipo: 'entrada',
                         quantidade,
@@ -2722,7 +2782,7 @@ ipcMain.handle(
                 // Valida os novos itens com o estoque já restaurado.
                 for (const item of itensNovos) {
 
-                    const produto = buscarEstoqueAtual.get(item.produto_id);
+                    const produto = await banco.consultarUm(buscarEstoqueAtual, [item.produto_id]);
 
                     if (!produto) {
                         throw new Error(`Produto não encontrado: ${item.produto_id}`);
@@ -2743,10 +2803,10 @@ ipcMain.handle(
                         item.valor_unitario * item.quantidade;
                 }
 
-                db.prepare(`
+                await banco.executar(`
                     DELETE FROM itens_os
                     WHERE os_id = ?
-                `).run(os.id);
+                `, [os.id]);
 
                 const valorPecasNovas = itensNovos.reduce(
                     (soma, item) => soma + item.subtotal,
@@ -2759,7 +2819,7 @@ ipcMain.handle(
 
                 const valorPecas = valorPecasLegado + valorPecasNovas;
 
-                const resultado = db.prepare(`
+                const resultado = await banco.executar(`
                     UPDATE ordens_servico
                     SET
                         cliente_id = @cliente_id,
@@ -2785,7 +2845,7 @@ ipcMain.handle(
                         total = @total,
                         observacoes = @observacoes
                     WHERE id = @id
-                `).run({
+                `, {
                     id: Number(os.id),
                     cliente_id: Number(os.cliente_id),
                     tipo_equipamento: os.tipo_equipamento || '',
@@ -2811,7 +2871,7 @@ ipcMain.handle(
                     observacoes: os.observacoes || null
                 });
 
-                const inserirItem = db.prepare(`
+                const inserirItem = `
                     INSERT INTO itens_os (
                         os_id,
                         produto_id,
@@ -2829,18 +2889,18 @@ ipcMain.handle(
                         @valor_unitario,
                         @subtotal
                     )
-                `);
+                `;
 
-                const baixarEstoque = db.prepare(`
+                const baixarEstoque = `
                     UPDATE produtos
                     SET estoque = estoque - @quantidade
                     WHERE id = @produto_id
-                `);
+                `;
 
                 // Baixa os novos itens e registra cada saída.
                 for (const item of itensNovos) {
 
-                    inserirItem.run({
+                    await banco.executar(inserirItem, {
                         os_id: Number(os.id),
                         produto_id: item.produto_id,
                         descricao: item.descricao,
@@ -2850,10 +2910,10 @@ ipcMain.handle(
                         subtotal: item.subtotal
                     });
 
-                    const produto = buscarEstoqueAtual.get(item.produto_id);
+                    const produto = await banco.consultarUm(buscarEstoqueAtual, [item.produto_id]);
                     const estoqueAnterior = Number(produto.estoque) || 0;
 
-                    baixarEstoque.run({
+                    await banco.executar(baixarEstoque, {
                         produto_id: item.produto_id,
                         quantidade: item.quantidade
                     });
@@ -2861,7 +2921,7 @@ ipcMain.handle(
                     const estoquePosterior =
                         estoqueAnterior - Number(item.quantidade);
 
-                    registrarMovimentacao.run({
+                    await banco.executar(registrarMovimentacao, {
                         produto_id: Number(item.produto_id),
                         tipo: 'saida',
                         quantidade: Number(item.quantidade),
@@ -2875,9 +2935,7 @@ ipcMain.handle(
                 return resultado.changes > 0;
             });
 
-            const resultadoExecucao = executar();
-
-            return { sucesso: Boolean(resultadoExecucao) };
+            return { sucesso: Boolean(sucessoEdicao) };
 
         } catch (erro) {
 
@@ -2896,7 +2954,7 @@ ipcMain.handle(
 
 ipcMain.handle(
     'excluir-ordem-servico',
-    (event, id) => {
+    async (event, id) => {
 
         try {
 
@@ -2909,37 +2967,37 @@ ipcMain.handle(
                 };
             }
 
-            const executar = db.transaction(() => {
+            const ordemExcluida = await acessoBanco.transacao(async banco => {
 
-                const osExistente = db.prepare(`
+                const osExistente = await banco.consultarUm(`
                     SELECT id, numero
                     FROM ordens_servico
                     WHERE id = ?
-                `).get(osId);
+                `, [osId]);
 
                 if (!osExistente) {
                     throw new Error('Ordem de serviço não encontrada.');
                 }
 
-                const itens = db.prepare(`
+                const itens = await banco.consultar(`
                     SELECT produto_id, quantidade
                     FROM itens_os
                     WHERE os_id = ?
-                `).all(osId);
+                `, [osId]);
 
-                const buscarEstoqueAtual = db.prepare(`
+                const buscarEstoqueAtual = `
                     SELECT id, nome, estoque
                     FROM produtos
                     WHERE id = ?
-                `);
+                `;
 
-                const devolverEstoque = db.prepare(`
+                const devolverEstoque = `
                     UPDATE produtos
                     SET estoque = estoque + @quantidade
                     WHERE id = @produto_id
-                `);
+                `;
 
-                const registrarMovimentacao = db.prepare(`
+                const registrarMovimentacao = `
                     INSERT INTO movimentacoes_estoque (
                         produto_id,
                         tipo,
@@ -2959,7 +3017,7 @@ ipcMain.handle(
                         'os',
                         @origem_id
                     )
-                `);
+                `;
 
                 // Ao excluir a OS, devolve as peças ao estoque
                 // e registra cada devolução no histórico.
@@ -2967,7 +3025,7 @@ ipcMain.handle(
 
                     if (!item.produto_id) continue;
 
-                    const produto = buscarEstoqueAtual.get(item.produto_id);
+                    const produto = await banco.consultarUm(buscarEstoqueAtual, [item.produto_id]);
 
                     if (!produto) {
                         throw new Error(`Produto não encontrado: ${item.produto_id}`);
@@ -2977,12 +3035,12 @@ ipcMain.handle(
                     const estoqueAnterior = Number(produto.estoque) || 0;
                     const estoquePosterior = estoqueAnterior + quantidade;
 
-                    devolverEstoque.run({
+                    await banco.executar(devolverEstoque, {
                         produto_id: Number(item.produto_id),
                         quantidade
                     });
 
-                    registrarMovimentacao.run({
+                    await banco.executar(registrarMovimentacao, {
                         produto_id: Number(item.produto_id),
                         quantidade,
                         estoque_anterior: estoqueAnterior,
@@ -2992,20 +3050,20 @@ ipcMain.handle(
                     });
                 }
 
-                db.prepare(`
+                await banco.executar(`
                     DELETE FROM garantias
                     WHERE os_id = ?
-                `).run(osId);
+                `, [osId]);
 
-                db.prepare(`
+                await banco.executar(`
                     DELETE FROM itens_os
                     WHERE os_id = ?
-                `).run(osId);
+                `, [osId]);
 
-                const resultado = db.prepare(`
+                const resultado = await banco.executar(`
                     DELETE FROM ordens_servico
                     WHERE id = ?
-                `).run(osId);
+                `, [osId]);
 
                 if (resultado.changes !== 1) {
                     throw new Error('A ordem de serviço não foi excluída.');
@@ -3017,13 +3075,11 @@ ipcMain.handle(
                 };
             });
 
-            const resultadoExecucao = executar();
-
             return {
                 sucesso: true,
                 os: {
-                    id: Number(resultadoExecucao.id),
-                    numero: Number(resultadoExecucao.numero)
+                    id: Number(ordemExcluida.id),
+                    numero: Number(ordemExcluida.numero)
                 }
             };
 
@@ -3050,9 +3106,9 @@ ipcMain.handle(
 
 ipcMain.handle(
     'listar-garantias',
-    () => {
+    async () => {
         // Sincroniza garantias originadas de vendas que já foram canceladas.
-        db.prepare(`
+        await acessoBanco.executar(`
             UPDATE garantias
             SET status = 'Cancelada'
             WHERE venda_id IN (
@@ -3060,16 +3116,16 @@ ipcMain.handle(
                 WHERE lower(COALESCE(status, '')) LIKE '%cancel%'
             )
               AND status <> 'Cancelada'
-        `).run();
+        `);
 
-        db.prepare(`
+        await acessoBanco.executar(`
             UPDATE garantias
             SET status = 'Expirada'
             WHERE status = 'Ativa'
               AND date(data_fim) < date('now', 'localtime')
-        `).run();
+        `);
 
-        return db.prepare(`
+        return acessoBanco.consultar(`
             SELECT
                 garantias.*,
                 clientes.nome AS cliente_nome,
@@ -3101,13 +3157,13 @@ ipcMain.handle(
             LEFT JOIN vendas ON vendas.id = garantias.venda_id
             LEFT JOIN ordens_servico ON ordens_servico.id = garantias.os_id
             ORDER BY garantias.id DESC
-        `).all();
+        `);
     }
 );
 
 ipcMain.handle(
     'cadastrar-garantia',
-    (event, garantia) => {
+    async (event, garantia) => {
         try {
             if (!garantia || !Number.isInteger(Number(garantia.cliente_id)) || Number(garantia.cliente_id) <= 0) {
                 return { sucesso: false, mensagem: 'Selecione um cliente.' };
@@ -3144,20 +3200,20 @@ ipcMain.handle(
 
             const formatarSQLite = data => {
                 const pad = n => String(n).padStart(2, '0');
-                return `${data.getFullYear()}-${pad(data.getMonth() + 1)}-${pad(data.getDate())} ${pad(data.getHours())}:${pad(data.getMinutes())}:${pad(data.getSeconds())}`;
+                return `${data.getFullYear()}-${pad(data.getMonth() + 1)}-${pad(data.getDate())}`;
             };
 
             const dataInicio = formatarSQLite(inicio);
             const dataFim = formatarSQLite(fim);
 
-            const executar = db.transaction(() => {
-                const resultado = db.prepare(`
+            const resultado = await acessoBanco.transacao(async banco => {
+                const insercao = await banco.executar(`
                     INSERT INTO garantias (
                         venda_id, os_id, cliente_id, produto_id,
                         descricao, prazo_dias, data_inicio, data_fim,
                         status, observacoes, cobertura, exclusoes
                     ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 'Ativa', ?, ?, ?)
-                `).run(
+                `, [
                     vendaId,
                     osId,
                     clienteId,
@@ -3168,30 +3224,27 @@ ipcMain.handle(
                     garantia.observacoes || '',
                     garantia.cobertura || '',
                     garantia.exclusoes || ''
-                );
+                ]);
 
-                const garantiaId = Number(resultado.lastInsertRowid);
+                const garantiaId = Number(insercao.lastInsertRowid);
 
                 if (produtoIds.length) {
-                    const produtoStmt = db.prepare(`SELECT id FROM produtos WHERE id = ?`);
-                    const itemStmt = db.prepare(`
+                    const itemSql = `
                         INSERT INTO garantia_itens (garantia_id, produto_id)
                         VALUES (?, ?)
-                    `);
+                    `;
 
                     for (const produtoId of produtoIds) {
-                        const produto = produtoStmt.get(produtoId);
+                        const produto = await banco.consultarUm('SELECT id FROM produtos WHERE id = ?', [produtoId]);
                         if (!produto) {
                             throw new Error(`Produto não encontrado: ${produtoId}`);
                         }
-                        itemStmt.run(garantiaId, produtoId);
+                        await banco.executar(itemSql, [garantiaId, produtoId]);
                     }
                 }
 
                 return { id: garantiaId, quantidade: produtoIds.length };
             });
-
-            const resultado = executar();
 
             return {
                 sucesso: true,
@@ -3212,7 +3265,7 @@ ipcMain.handle(
 
 ipcMain.handle(
     'editar-garantia',
-    (event, dados) => {
+    async (event, dados) => {
         try {
             const garantiaId = Number(dados?.id);
             const clienteId = Number(dados?.cliente_id);
@@ -3239,16 +3292,16 @@ ipcMain.handle(
                 return { sucesso: false, mensagem: 'Informe um prazo válido em dias.' };
             }
 
-            const atual = db.prepare(`
+            const atual = await acessoBanco.consultarUm(`
                 SELECT id, data_inicio
                 FROM garantias
                 WHERE id = ?
-            `).get(garantiaId);
+            `, [garantiaId]);
             if (!atual) return { sucesso: false, mensagem: 'Garantia não encontrada.' };
 
             const origem = vendaId
-                ? db.prepare('SELECT id, cliente_id FROM vendas WHERE id = ?').get(vendaId)
-                : db.prepare('SELECT id, cliente_id FROM ordens_servico WHERE id = ?').get(osId);
+                ? await acessoBanco.consultarUm('SELECT id, cliente_id FROM vendas WHERE id = ?', [vendaId])
+                : await acessoBanco.consultarUm('SELECT id, cliente_id FROM ordens_servico WHERE id = ?', [osId]);
             if (!origem) return { sucesso: false, mensagem: 'Venda ou ordem de serviço não encontrada.' };
             if (Number(origem.cliente_id) !== clienteId) {
                 return { sucesso: false, mensagem: 'A origem selecionada não pertence ao cliente escolhido.' };
@@ -3258,8 +3311,8 @@ ipcMain.handle(
                 ? [...new Set(dados.produto_ids.map(Number).filter(id => Number.isInteger(id) && id > 0))]
                 : [];
             const itensOrigem = vendaId
-                ? db.prepare('SELECT DISTINCT produto_id FROM itens_venda WHERE venda_id = ?').all(vendaId)
-                : db.prepare('SELECT DISTINCT produto_id FROM itens_os WHERE os_id = ? AND produto_id IS NOT NULL').all(osId);
+                ? await acessoBanco.consultar('SELECT DISTINCT produto_id FROM itens_venda WHERE venda_id = ?', [vendaId])
+                : await acessoBanco.consultar('SELECT DISTINCT produto_id FROM itens_os WHERE os_id = ? AND produto_id IS NOT NULL', [osId]);
             const produtosPermitidos = new Set(itensOrigem.map(item => Number(item.produto_id)));
             if (produtoIds.some(id => !produtosPermitidos.has(id))) {
                 return { sucesso: false, mensagem: 'Selecione somente produtos vinculados à origem escolhida.' };
@@ -3272,35 +3325,35 @@ ipcMain.handle(
             const dataFim = new Date(dataInicio.getTime());
             dataFim.setDate(dataFim.getDate() + prazoDias);
             const pad = numero => String(numero).padStart(2, '0');
-            const formatarSQLite = data => `${data.getFullYear()}-${pad(data.getMonth() + 1)}-${pad(data.getDate())} ${pad(data.getHours())}:${pad(data.getMinutes())}:${pad(data.getSeconds())}`;
+            const formatarSQLite = data => `${data.getFullYear()}-${pad(data.getMonth() + 1)}-${pad(data.getDate())}`;
             const fimFormatado = formatarSQLite(dataFim);
             const agora = new Date();
             const hoje = `${agora.getFullYear()}-${pad(agora.getMonth() + 1)}-${pad(agora.getDate())}`;
             const status = fimFormatado.slice(0, 10) < hoje ? 'Expirada' : 'Ativa';
 
-            const executar = db.transaction(() => {
-                db.prepare(`
+            const resultado = await acessoBanco.transacao(async banco => {
+                await banco.executar(`
                     UPDATE garantias
                     SET venda_id = ?, os_id = ?, cliente_id = ?, produto_id = NULL,
                         descricao = ?, prazo_dias = ?, data_fim = ?, status = ?, observacoes = ?,
                         cobertura = ?, exclusoes = ?
                     WHERE id = ?
-                `).run(
+                `, [
                     vendaId, osId, clienteId, descricao, prazoDias,
                     fimFormatado, status, observacoes, cobertura, exclusoes, garantiaId
-                );
+                ]);
 
-                db.prepare('DELETE FROM garantia_itens WHERE garantia_id = ?').run(garantiaId);
-                const inserirProduto = db.prepare(`
+                await banco.executar('DELETE FROM garantia_itens WHERE garantia_id = ?', [garantiaId]);
+                const inserirProduto = `
                     INSERT INTO garantia_itens (garantia_id, produto_id)
                     VALUES (?, ?)
-                `);
-                for (const produtoId of produtoIds) inserirProduto.run(garantiaId, produtoId);
+                `;
+                for (const produtoId of produtoIds) await banco.executar(inserirProduto, [garantiaId, produtoId]);
 
                 return { id: garantiaId, quantidade: produtoIds.length, data_fim: fimFormatado, status };
             });
 
-            return { sucesso: true, ...executar() };
+            return { sucesso: true, ...resultado };
         } catch (erro) {
             console.error('Erro ao editar garantia:', erro);
             return { sucesso: false, mensagem: erro.message || 'Não foi possível atualizar a garantia.' };
@@ -3320,23 +3373,12 @@ ipcMain.handle(
 */
 
 // Calcula o próximo número amigável que será impresso e mostrado ao usuário.
-function proximoNumeroVenda() {
-
-    const resultado = db
-        .prepare(`
-            SELECT
-                COALESCE(
-                    MAX(numero),
-                    0
-                ) + 1 AS proximo_numero
-
-            FROM vendas
-        `)
-        .get();
-
-
-    return resultado.proximo_numero;
-
+async function proximoNumeroVenda(banco = acessoBanco) {
+    const resultado = await banco.consultarUm(`
+        SELECT COALESCE(MAX(numero), 0) + 1 AS proximo_numero
+        FROM vendas
+    `);
+    return Number(resultado?.proximo_numero || 1);
 }
 
 
@@ -3346,505 +3388,81 @@ function proximoNumeroVenda() {
 
 ipcMain.handle(
     'finalizar-venda',
-    (event, venda) => {
-
+    async (event, venda) => {
         try {
-
-            /*
-                ======================================
-                VALIDAR ITENS
-                ======================================
-            */
-
-            if (
-                !venda ||
-                !Array.isArray(venda.itens) ||
-                venda.itens.length === 0
-            ) {
-
-                return {
-
-                    sucesso: false,
-
-                    mensagem:
-                        'A venda precisa ter pelo menos um produto.'
-
-                };
-
+            if (!venda || !Array.isArray(venda.itens) || venda.itens.length === 0) {
+                return { sucesso: false, mensagem: 'A venda precisa ter pelo menos um produto.' };
+            }
+            for (const item of venda.itens) {
+                if (!Number.isInteger(Number(item.quantidade)) || Number(item.quantidade) <= 0) {
+                    return { sucesso: false, mensagem: 'A quantidade dos produtos deve ser maior que zero.' };
+                }
             }
 
-
-            /*
-                ======================================
-                VALIDAR QUANTIDADES
-                ======================================
-            */
-
-            for (const item of venda.itens) {
-
-                const quantidade =
-                    Number(item.quantidade);
-
-
-                if (
-                    !Number.isInteger(quantidade) ||
-                    quantidade <= 0
-                ) {
-
-                    return {
-
-                        sucesso: false,
-
-                        mensagem:
-                            'A quantidade dos produtos deve ser maior que zero.'
-
-                    };
-
+            const resultado = await acessoBanco.transacao(async banco => {
+                let subtotal = 0;
+                const itensProcessados = [];
+                for (const item of venda.itens) {
+                    const produto = await banco.consultarUm('SELECT * FROM produtos WHERE id = ?', [item.produto_id]);
+                    if (!produto) throw new Error(`Produto não encontrado: ${item.produto_id}`);
+                    const quantidade = Number(item.quantidade);
+                    if (Number(produto.estoque) < quantidade) {
+                        throw new Error(`Estoque insuficiente para o produto "${produto.nome}". Estoque disponível: ${produto.estoque}.`);
+                    }
+                    const precoUnitario = Number(produto.preco_venda) || 0;
+                    const subtotalItem = precoUnitario * quantidade;
+                    subtotal += subtotalItem;
+                    itensProcessados.push({ produto_id: Number(produto.id), quantidade, preco_unitario: precoUnitario, subtotal: subtotalItem });
                 }
 
-            }
-
-
-            /*
-                ======================================
-                TRANSAÇÃO
-                ======================================
-            */
-
-            const executarVenda =
-                db.transaction(() => {
-
-                    let subtotal = 0;
-
-                    const itensProcessados = [];
-
-
-                    /*
-                        ==============================
-                        BUSCAR PRODUTOS
-                        ==============================
-                    */
-
-                    for (const item of venda.itens) {
-
-                        const produto =
-                            db
-                                .prepare(`
-                                    SELECT *
-
-                                    FROM produtos
-
-                                    WHERE id = ?
-                                `)
-                                .get(item.produto_id);
-
-
-                        if (!produto) {
-
-                            throw new Error(
-                                `Produto não encontrado: ${item.produto_id}`
-                            );
-
-                        }
-
-
-                        const quantidade =
-                            Number(item.quantidade);
-
-
-                        /*
-                            ==========================
-                            VERIFICAR ESTOQUE
-                            ==========================
-                        */
-
-                        if (
-                            produto.estoque <
-                            quantidade
-                        ) {
-
-                            throw new Error(
-                                `Estoque insuficiente para o produto "${produto.nome}". Estoque disponível: ${produto.estoque}.`
-                            );
-
-                        }
-
-
-                        /*
-                            ==========================
-                            USAR PREÇO ATUAL
-                            ==========================
-                        */
-
-                        const precoUnitario =
-                            Number(
-                                produto.preco_venda
-                            ) || 0;
-
-
-                        const subtotalItem =
-                            precoUnitario *
-                            quantidade;
-
-
-                        subtotal +=
-                            subtotalItem;
-
-
-                        itensProcessados.push({
-
-                            produto_id:
-                                produto.id,
-
-                            quantidade:
-                                quantidade,
-
-                            preco_unitario:
-                                precoUnitario,
-
-                            subtotal:
-                                subtotalItem
-
-                        });
-
-                    }
-
-
-                    /*
-                        ==============================
-                        DESCONTO
-                        ==============================
-                    */
-
-                    let desconto =
-                        Number(venda.desconto) || 0;
-
-
-                    if (desconto < 0) {
-
-                        desconto = 0;
-
-                    }
-
-
-                    if (desconto > subtotal) {
-
-                        desconto = subtotal;
-
-                    }
-
-
-                    const total =
-                        subtotal - desconto;
-
-
-                    /*
-                        ==============================
-                        NÚMERO DA VENDA
-                        ==============================
-                    */
-
-                    const numero =
-                        proximoNumeroVenda();
-
-
-                    /*
-                        ==============================
-                        GRAVAR VENDA
-                        ==============================
-                    */
-
-                    const resultadoVenda =
-                        db
-                            .prepare(`
-
-                                INSERT INTO vendas (
-
-                                    numero,
-
-                                    cliente_id,
-
-                                    subtotal,
-
-                                    desconto,
-
-                                    total,
-
-                                    forma_pagamento,
-
-                                    observacoes
-
-                                )
-
-                                VALUES (
-
-                                    @numero,
-
-                                    @cliente_id,
-
-                                    @subtotal,
-
-                                    @desconto,
-
-                                    @total,
-
-                                    @forma_pagamento,
-
-                                    @observacoes
-
-                                )
-
-                            `)
-                            .run({
-
-                                numero:
-
-                                    numero,
-
-                                cliente_id:
-
-                                    venda.cliente_id ||
-                                    null,
-
-                                subtotal:
-
-                                    subtotal,
-
-                                desconto:
-
-                                    desconto,
-
-                                total:
-
-                                    total,
-
-                                forma_pagamento:
-
-                                    venda.forma_pagamento ||
-                                    null,
-
-                                observacoes:
-
-                                    venda.observacoes ||
-                                    null
-
-                            });
-
-
-                    const vendaId =
-                        resultadoVenda.lastInsertRowid;
-
-
-                    /*
-                        ==============================
-                        GRAVAR ITENS
-                        ==============================
-                    */
-
-                    const inserirItem =
-                        db.prepare(`
-
-                            INSERT INTO itens_venda (
-
-                                venda_id,
-
-                                produto_id,
-
-                                quantidade,
-
-                                preco_unitario,
-
-                                subtotal
-
-                            )
-
-                            VALUES (
-
-                                @venda_id,
-
-                                @produto_id,
-
-                                @quantidade,
-
-                                @preco_unitario,
-
-                                @subtotal
-
-                            )
-
-                        `);
-
-
-                    /*
-                        ==============================
-                        BAIXAR ESTOQUE
-                        ==============================
-                    */
-
-                    const buscarEstoqueAtual =
-                        db.prepare(`
-                            SELECT estoque
-                            FROM produtos
-                            WHERE id = ?
-                        `);
-
-
-                    const baixarEstoque =
-                        db.prepare(`
-
-                            UPDATE produtos
-
-                            SET estoque =
-                                estoque - ?
-
-                            WHERE id = ?
-
-                        `);
-
-
-                    const registrarMovimentacao =
-                        db.prepare(`
-                            INSERT INTO movimentacoes_estoque (
-                                produto_id,
-                                tipo,
-                                quantidade,
-                                estoque_anterior,
-                                estoque_posterior,
-                                motivo,
-                                origem,
-                                origem_id
-                            )
-                            VALUES (
-                                @produto_id,
-                                'saida',
-                                @quantidade,
-                                @estoque_anterior,
-                                @estoque_posterior,
-                                @motivo,
-                                'venda',
-                                @origem_id
-                            )
-                        `);
-
-
-                    for (
-                        const item
-                        of itensProcessados
-                    ) {
-
-                        inserirItem.run({
-
-                            venda_id:
-                                vendaId,
-
-                            produto_id:
-                                item.produto_id,
-
-                            quantidade:
-                                item.quantidade,
-
-                            preco_unitario:
-                                item.preco_unitario,
-
-                            subtotal:
-                                item.subtotal
-
-                        });
-
-
-                        const estoqueAntes =
-                            buscarEstoqueAtual
-                                .get(item.produto_id);
-
-                        const estoqueAnterior =
-                            Number(estoqueAntes?.estoque || 0);
-
-                        baixarEstoque.run(
-
-                            item.quantidade,
-
-                            item.produto_id
-
-                        );
-
-                        const estoquePosterior =
-                            estoqueAnterior - item.quantidade;
-
-                        registrarMovimentacao.run({
-                            produto_id: item.produto_id,
-                            quantidade: item.quantidade,
-                            estoque_anterior: estoqueAnterior,
-                            estoque_posterior: estoquePosterior,
-                            motivo: `Venda nº ${String(numero).padStart(6, '0')}`,
-                            origem_id: Number(vendaId)
-                        });
-
-                    }
-
-
-                    /*
-                        ==============================
-                        RETORNAR RESULTADO
-                        ==============================
-                    */
-
-                    return {
-
-                        venda_id:
-                            Number(vendaId),
-
-                        numero:
-                            numero,
-
-                        subtotal:
-                            subtotal,
-
-                        desconto:
-                            desconto,
-
-                        total:
-                            total
-
-                    };
-
+                const desconto = Math.min(subtotal, Math.max(0, Number(venda.desconto) || 0));
+                const total = subtotal - desconto;
+                const numero = await proximoNumeroVenda(banco);
+                const insercao = await banco.executar(`
+                    INSERT INTO vendas (numero, cliente_id, subtotal, desconto, total, forma_pagamento, observacoes)
+                    VALUES (@numero, @cliente_id, @subtotal, @desconto, @total, @forma_pagamento, @observacoes)
+                `, {
+                    numero,
+                    cliente_id: venda.cliente_id || null,
+                    subtotal,
+                    desconto,
+                    total,
+                    forma_pagamento: venda.forma_pagamento || null,
+                    observacoes: venda.observacoes || null
                 });
+                // O executeAsync do node-firebird confirma INSERT ... RETURNING,
+                // mas não entrega a linha retornada. Use o número único da venda
+                // para recuperar a chave na mesma transação antes de gravar itens.
+                const vendaGravada = await banco.consultarUm(
+                    'SELECT id FROM vendas WHERE numero = ?',
+                    [numero]
+                );
+                const vendaId = Number(vendaGravada?.id || insercao.lastInsertRowid || 0);
+                if (!vendaId) throw new Error('Não foi possível obter o identificador da venda gravada.');
 
+                for (const item of itensProcessados) {
+                    await banco.executar(`
+                        INSERT INTO itens_venda (venda_id, produto_id, quantidade, preco_unitario, subtotal)
+                        VALUES (@venda_id, @produto_id, @quantidade, @preco_unitario, @subtotal)
+                    `, { venda_id: vendaId, ...item });
 
-            const resultado =
-                executarVenda();
-
-
-            return {
-
-                sucesso: true,
-
-                venda:
-                    resultado
-
-            };
-
+                    const estoqueAntes = await banco.consultarUm('SELECT estoque FROM produtos WHERE id = ?', [item.produto_id]);
+                    const estoqueAnterior = Number(estoqueAntes?.estoque || 0);
+                    await banco.executar('UPDATE produtos SET estoque = estoque - ? WHERE id = ?', [item.quantidade, item.produto_id]);
+                    await banco.executar(`
+                        INSERT INTO movimentacoes_estoque (
+                            produto_id, tipo, quantidade, estoque_anterior, estoque_posterior, motivo, origem, origem_id
+                        ) VALUES (?, 'saida', ?, ?, ?, ?, 'venda', ?)
+                    `, [item.produto_id, item.quantidade, estoqueAnterior, estoqueAnterior - item.quantidade,
+                        `Venda nº ${String(numero).padStart(6, '0')}`, vendaId]);
+                }
+                return { venda_id: vendaId, numero, subtotal, desconto, total };
+            });
+            return { sucesso: true, venda: resultado };
+        } catch (erro) {
+            console.error('Erro ao finalizar venda:', erro);
+            return { sucesso: false, mensagem: erro.message || 'Não foi possível finalizar a venda.' };
         }
-
-        catch (erro) {
-
-            console.error(
-                'Erro ao finalizar venda:',
-                erro
-            );
-
-
-            return {
-
-                sucesso: false,
-
-                mensagem:
-                    erro.message ||
-                    'Não foi possível finalizar a venda.'
-
-            };
-
-        }
-
     }
 );
 
@@ -3857,35 +3475,87 @@ ipcMain.handle(
 
 ipcMain.handle(
     'listar-vendas',
-    () => {
-
-        const vendas = db
-            .prepare(`
-
-                SELECT
-
-                    vendas.*,
-
-                    clientes.nome AS cliente_nome
-
-                FROM vendas
-
-                LEFT JOIN clientes
-
-                    ON clientes.id =
-                       vendas.cliente_id
-
-                ORDER BY
-                    vendas.id DESC
-
-            `)
-            .all();
-
-
-        return vendas;
-
-    }
+    () => acessoBanco.consultar(`
+        SELECT vendas.*, clientes.nome AS cliente_nome
+        FROM vendas
+        LEFT JOIN clientes ON clientes.id = vendas.cliente_id
+        ORDER BY vendas.id DESC
+    `)
 );
+
+
+/*
+    ==================================================
+    DADOS DO RELATÓRIO
+    ==================================================
+*/
+
+ipcMain.handle('obter-dados-relatorio', async () => {
+    const [vendas, ordens, produtos, itensVenda] = await Promise.all([
+        acessoBanco.consultar(`
+            SELECT id, cliente_id, status, total, forma_pagamento, data_hora
+            FROM vendas
+            ORDER BY id DESC
+        `),
+        acessoBanco.consultar(`
+            SELECT id, cliente_id, status, total, data_hora_abertura
+            FROM ordens_servico
+            ORDER BY id DESC
+        `),
+        acessoBanco.consultar(`
+            SELECT id, nome, estoque, estoque_minimo
+            FROM produtos
+            ORDER BY id DESC
+        `),
+        acessoBanco.consultar(`
+            SELECT itens_venda.venda_id, itens_venda.produto_id,
+                   itens_venda.quantidade, itens_venda.preco_unitario,
+                   itens_venda.subtotal, produtos.nome AS produto_nome,
+                   produtos.sku, produtos.codigo_barras
+            FROM itens_venda
+            INNER JOIN produtos ON produtos.id = itens_venda.produto_id
+            ORDER BY itens_venda.venda_id DESC, itens_venda.id ASC
+        `)
+    ]);
+
+    return { vendas, ordens, produtos, itensVenda };
+});
+
+ipcMain.handle('obter-dados-dashboard', async () => {
+    const [vendas, ordens, produtos, clientes] = await Promise.all([
+        acessoBanco.consultar(`
+            SELECT id, numero, cliente_id, status, total, data_hora
+            FROM vendas
+            ORDER BY id DESC
+        `),
+        acessoBanco.consultar(`
+            SELECT id, numero, cliente_id, tipo_equipamento, marca, modelo,
+                   status, data_hora_abertura
+            FROM ordens_servico
+            ORDER BY id DESC
+        `),
+        acessoBanco.consultar(`
+            SELECT id, nome, estoque, estoque_minimo, preco_venda
+            FROM produtos
+            ORDER BY id DESC
+        `),
+        acessoBanco.consultar(`
+            SELECT id, nome
+            FROM clientes
+            ORDER BY id DESC
+        `)
+    ]);
+
+    return { vendas, ordens, produtos, clientes };
+});
+
+// Revisão leve para as estações detectarem gravações feitas por outro computador.
+ipcMain.handle('obter-revisao-dados-compartilhados', async () => {
+    const linha = await acessoBanco.consultarUm(
+        'SELECT COALESCE(MAX(id), 0) AS revisao FROM auditoria'
+    );
+    return { sucesso: true, revisao: Number(linha?.revisao || 0) };
+});
 
 
 /*
@@ -3896,84 +3566,23 @@ ipcMain.handle(
 
 ipcMain.handle(
     'buscar-venda',
-    (event, id) => {
-
-        const venda =
-            db
-                .prepare(`
-
-                    SELECT
-
-                        vendas.*,
-
-                        clientes.nome AS cliente_nome,
-
-                        clientes.cpf_cnpj,
-
-                        clientes.telefone,
-
-                        clientes.celular,
-
-                        clientes.email
-
-                    FROM vendas
-
-                    LEFT JOIN clientes
-
-                        ON clientes.id =
-                           vendas.cliente_id
-
-                    WHERE vendas.id = ?
-
-                `)
-                .get(id);
-
-
-        if (!venda) {
-
-            return null;
-
-        }
-
-
-        const itens =
-            db
-                .prepare(`
-
-                    SELECT
-
-                        itens_venda.*,
-
-                        produtos.nome AS produto_nome,
-
-                        produtos.sku,
-
-                        produtos.codigo_barras
-
-                    FROM itens_venda
-
-                    INNER JOIN produtos
-
-                        ON produtos.id =
-                           itens_venda.produto_id
-
-                    WHERE itens_venda.venda_id = ?
-
-                    ORDER BY itens_venda.id
-
-                `)
-                .all(id);
-
-
-        return {
-
-            ...venda,
-
-            itens:
-                itens
-
-        };
-
+    async (event, id) => {
+        const venda = await acessoBanco.consultarUm(`
+            SELECT vendas.*, clientes.nome AS cliente_nome, clientes.cpf_cnpj,
+                   clientes.telefone, clientes.celular, clientes.email
+            FROM vendas
+            LEFT JOIN clientes ON clientes.id = vendas.cliente_id
+            WHERE vendas.id = ?
+        `, [id]);
+        if (!venda) return null;
+        const itens = await acessoBanco.consultar(`
+            SELECT itens_venda.*, produtos.nome AS produto_nome, produtos.sku, produtos.codigo_barras
+            FROM itens_venda
+            INNER JOIN produtos ON produtos.id = itens_venda.produto_id
+            WHERE itens_venda.venda_id = ?
+            ORDER BY itens_venda.id
+        `, [id]);
+        return { ...venda, itens };
     }
 );
 
@@ -3987,7 +3596,7 @@ ipcMain.handle(
     ==================================================
 */
 
-ipcMain.handle('cancelar-venda', (event, dados) => {
+ipcMain.handle('cancelar-venda', async (event, dados) => {
     try {
         const vendaId = Number(typeof dados === 'object' ? dados?.id : dados);
         const motivo = String(typeof dados === 'object' ? dados?.motivo || '' : '').trim();
@@ -3995,40 +3604,36 @@ ipcMain.handle('cancelar-venda', (event, dados) => {
         if (motivo.length < 3) return { sucesso: false, mensagem: 'Informe o motivo do cancelamento.' };
         if (motivo.length > 500) return { sucesso: false, mensagem: 'O motivo deve ter até 500 caracteres.' };
 
-        const executar = db.transaction(() => {
-            const venda = db.prepare('SELECT id, numero, status FROM vendas WHERE id = ?').get(vendaId);
+        const resultado = await acessoBanco.transacao(async banco => {
+            const venda = await banco.consultarUm('SELECT id, numero, status FROM vendas WHERE id = ?', [vendaId]);
             if (!venda) throw new Error('Venda não encontrada.');
             if (String(venda.status || '').toLowerCase().includes('cancel')) throw new Error('Esta venda já foi cancelada.');
 
-            const itens = db.prepare('SELECT produto_id, quantidade FROM itens_venda WHERE venda_id = ? ORDER BY id').all(vendaId);
-            const buscarProduto = db.prepare('SELECT id, nome, estoque FROM produtos WHERE id = ?');
-            const devolverEstoque = db.prepare('UPDATE produtos SET estoque = estoque + ? WHERE id = ?');
-            const registrarEstorno = db.prepare(`
-                INSERT INTO movimentacoes_estoque (produto_id,tipo,quantidade,estoque_anterior,estoque_posterior,motivo,origem,origem_id)
-                VALUES (?,'entrada',?,?,?,?, 'cancelamento_venda',?)
-            `);
-
+            const itens = await banco.consultar('SELECT produto_id, quantidade FROM itens_venda WHERE venda_id = ? ORDER BY id', [vendaId]);
             for (const item of itens) {
-                const produto = buscarProduto.get(item.produto_id);
+                const produto = await banco.consultarUm('SELECT id, nome, estoque FROM produtos WHERE id = ?', [item.produto_id]);
                 if (!produto) throw new Error(`O produto ID ${item.produto_id} não foi encontrado. A venda não foi cancelada.`);
                 const quantidade = Number(item.quantidade) || 0;
                 const anterior = Number(produto.estoque) || 0;
                 const posterior = anterior + quantidade;
-                devolverEstoque.run(quantidade, item.produto_id);
-                registrarEstorno.run(item.produto_id, quantidade, anterior, posterior,
-                    `Estorno da venda nº ${String(venda.numero).padStart(6, '0')} — ${motivo}`, vendaId);
+                await banco.executar('UPDATE produtos SET estoque = estoque + ? WHERE id = ?', [quantidade, item.produto_id]);
+                await banco.executar(`
+                INSERT INTO movimentacoes_estoque (produto_id,tipo,quantidade,estoque_anterior,estoque_posterior,motivo,origem,origem_id)
+                VALUES (?,'entrada',?,?,?,?, 'cancelamento_venda',?)
+                `, [item.produto_id, quantidade, anterior, posterior,
+                    `Estorno da venda nº ${String(venda.numero).padStart(6, '0')} — ${motivo}`, vendaId]);
             }
 
-            db.prepare(`UPDATE vendas SET status = 'Cancelada', cancelada_em = CURRENT_TIMESTAMP, cancelamento_motivo = ? WHERE id = ?`).run(motivo, vendaId);
-            db.prepare(`
+            await banco.executar(`UPDATE vendas SET status = 'Cancelada', cancelada_em = CURRENT_TIMESTAMP, cancelamento_motivo = ? WHERE id = ?`, [motivo, vendaId]);
+            await banco.executar(`
                 UPDATE garantias
                 SET status = 'Cancelada'
                 WHERE venda_id = ? AND status <> 'Cancelada'
-            `).run(vendaId);
+            `, [vendaId]);
             return { venda_id: vendaId, numero: Number(venda.numero), itens_devolvidos: itens.length };
         });
 
-        return { sucesso: true, venda: executar() };
+        return { sucesso: true, venda: resultado };
     } catch (erro) {
         console.error('Erro ao cancelar venda:', erro);
         return { sucesso: false, mensagem: erro.message || 'Não foi possível cancelar a venda.' };
@@ -4044,7 +3649,7 @@ ipcMain.handle('cancelar-venda', (event, dados) => {
 
 ipcMain.handle(
     'excluir-venda',
-    (event, idInformado) => {
+    async (event, idInformado) => {
         try {
             const vendaId = Number(
                 typeof idInformado === 'object' ? idInformado?.id : idInformado
@@ -4054,51 +3659,26 @@ ipcMain.handle(
                 return { sucesso: false, mensagem: 'Venda inválida.' };
             }
 
-            const executar = db.transaction(() => {
-                const venda = db.prepare(`
+            const resultado = await acessoBanco.transacao(async banco => {
+                const venda = await banco.consultarUm(`
                     SELECT id, numero, subtotal, desconto, total
                     FROM vendas
                     WHERE id = ?
-                `).get(vendaId);
+                `, [vendaId]);
 
                 if (!venda) {
                     throw new Error('Venda não encontrada.');
                 }
 
-                const itens = db.prepare(`
+                const itens = await banco.consultar(`
                     SELECT produto_id, quantidade
                     FROM itens_venda
                     WHERE venda_id = ?
                     ORDER BY id
-                `).all(vendaId);
-
-                const buscarProduto = db.prepare(`
-                    SELECT id, nome, estoque
-                    FROM produtos
-                    WHERE id = ?
-                `);
-
-                const devolverEstoque = db.prepare(`
-                    UPDATE produtos
-                    SET estoque = estoque + ?
-                    WHERE id = ?
-                `);
-
-                const registrarEstorno = db.prepare(`
-                    INSERT INTO movimentacoes_estoque (
-                        produto_id,
-                        tipo,
-                        quantidade,
-                        estoque_anterior,
-                        estoque_posterior,
-                        motivo,
-                        origem,
-                        origem_id
-                    ) VALUES (?, 'entrada', ?, ?, ?, ?, 'estorno_venda', ?)
-                `);
+                `, [vendaId]);
 
                 for (const item of itens) {
-                    const produto = buscarProduto.get(item.produto_id);
+                    const produto = await banco.consultarUm('SELECT id, nome, estoque FROM produtos WHERE id = ?', [item.produto_id]);
                     if (!produto) {
                         throw new Error(`O produto ID ${item.produto_id} não foi encontrado. A venda não foi excluída.`);
                     }
@@ -4107,27 +3687,25 @@ ipcMain.handle(
                     const estoqueAnterior = Number(produto.estoque) || 0;
                     const estoquePosterior = estoqueAnterior + quantidade;
 
-                    devolverEstoque.run(quantidade, item.produto_id);
-
-                    registrarEstorno.run(
-                        item.produto_id,
-                        quantidade,
-                        estoqueAnterior,
-                        estoquePosterior,
-                        `Estorno da venda nº ${String(venda.numero).padStart(6, '0')} — venda excluída`,
-                        vendaId
-                    );
+                    await banco.executar('UPDATE produtos SET estoque = estoque + ? WHERE id = ?', [quantidade, item.produto_id]);
+                    await banco.executar(`
+                        INSERT INTO movimentacoes_estoque (
+                            produto_id, tipo, quantidade, estoque_anterior, estoque_posterior,
+                            motivo, origem, origem_id
+                        ) VALUES (?, 'entrada', ?, ?, ?, ?, 'estorno_venda', ?)
+                    `, [item.produto_id, quantidade, estoqueAnterior, estoquePosterior,
+                        `Estorno da venda nº ${String(venda.numero).padStart(6, '0')} — venda excluída`, vendaId]);
                 }
 
                 // Remove as movimentações originais da venda para que ela deixe
                 // de aparecer como uma venda válida no histórico de estoque.
-                db.prepare(`
+                await banco.executar(`
                     DELETE FROM movimentacoes_estoque
                     WHERE origem = 'venda' AND origem_id = ?
-                `).run(vendaId);
+                `, [vendaId]);
 
                 // itens_venda possui ON DELETE CASCADE.
-                db.prepare(`DELETE FROM vendas WHERE id = ?`).run(vendaId);
+                await banco.executar(`DELETE FROM vendas WHERE id = ?`, [vendaId]);
 
                 return {
                     venda_id: vendaId,
@@ -4135,8 +3713,6 @@ ipcMain.handle(
                     itens_devolvidos: itens.length
                 };
             });
-
-            const resultado = executar();
             return { sucesso: true, venda: resultado };
         } catch (erro) {
             console.error('Erro ao excluir venda:', erro);
@@ -4156,22 +3732,22 @@ ipcMain.handle(
     ==================================================
 */
 
-ipcMain.handle('listar-usuarios', () => {
-    const usuarios = db.prepare(`
+ipcMain.handle('listar-usuarios', async () => {
+    const usuarios = await acessoBanco.consultar(`
         SELECT id, nome, usuario, perfil, ativo, primeiro_acesso, criado_em, atualizado_em
         FROM usuarios
         ORDER BY id ASC
-    `).all();
+    `);
 
-    return usuarios.map(usuario => ({
+    return Promise.all(usuarios.map(async usuario => ({
         ...usuario,
         ativo: Number(usuario.ativo) === 1,
         primeiro_acesso: Number(usuario.primeiro_acesso) === 1,
-        permissoes: buscarPermissoesUsuario(usuario.id, usuario.perfil)
-    }));
+        permissoes: await buscarPermissoesUsuario(usuario.id, usuario.perfil)
+    })));
 });
 
-ipcMain.handle('cadastrar-usuario', (event, dados) => {
+ipcMain.handle('cadastrar-usuario', async (event, dados) => {
     try {
         const nome = String(dados?.nome || '').trim();
         const usuario = String(dados?.usuario || '').trim();
@@ -4181,23 +3757,39 @@ ipcMain.handle('cadastrar-usuario', (event, dados) => {
         if (!nome || !usuario || !senha) return { sucesso: false, mensagem: 'Preencha nome, usuário e senha.' };
         if (senha.length < 6) return { sucesso: false, mensagem: 'A senha deve possuir pelo menos 6 caracteres.' };
         if (!/^[a-zA-Z0-9._-]+$/.test(usuario)) return { sucesso: false, mensagem: 'O usuário deve conter apenas letras, números, ponto, hífen ou sublinhado.' };
-        if (db.prepare(`SELECT id FROM usuarios WHERE lower(usuario) = lower(?)`).get(usuario)) return { sucesso: false, mensagem: 'Este nome de usuário já está em uso.' };
+        const resultado = await acessoBanco.transacao(async banco => {
+            if (await banco.consultarUm('SELECT id FROM usuarios WHERE lower(usuario) = lower(?)', [usuario])) {
+                throw new Error('Este nome de usuário já está em uso.');
+            }
 
-        const senhaGerada = gerarSenha(senha);
-        const resultado = db.prepare(`
-            INSERT INTO usuarios (nome, usuario, senha_hash, senha_salt, perfil, ativo, primeiro_acesso)
-            VALUES (?, ?, ?, ?, ?, 1, 1)
-        `).run(nome, usuario, senhaGerada.hash, senhaGerada.salt, perfil);
+            const senhaGerada = gerarSenha(senha);
+            const insercao = await banco.executar(`
+                INSERT INTO usuarios (nome, usuario, senha_hash, senha_salt, perfil, ativo, primeiro_acesso)
+                VALUES (?, ?, ?, ?, ?, 1, 1)
+            `, [nome, usuario, senhaGerada.hash, senhaGerada.salt, perfil]);
 
-        garantirPermissoesUsuario(Number(resultado.lastInsertRowid), perfil);
-        return { sucesso: true, id: Number(resultado.lastInsertRowid) };
+            // O adaptador Firebird não fornece lastInsertRowid para INSERT.
+            // Recupere o ID pela chave de usuário, dentro da mesma transação,
+            // antes de inserir as permissões que dependem da FK.
+            const usuarioCriado = await banco.consultarUm(
+                'SELECT id FROM usuarios WHERE usuario = ?',
+                [usuario]
+            );
+            const usuarioId = Number(usuarioCriado?.id || 0);
+            if (!usuarioId) throw new Error('O usuário foi inserido, mas não foi possível recuperar seu identificador.');
+
+            await garantirPermissoesNoEscopo(banco, usuarioId, perfil);
+            return usuarioId;
+        });
+        return { sucesso: true, id: resultado };
     } catch (erro) {
+        if (erro.message === 'Este nome de usuário já está em uso.') return { sucesso: false, mensagem: erro.message };
         console.error('Erro ao cadastrar usuário:', erro);
         return { sucesso: false, mensagem: erro.message || 'Não foi possível cadastrar o usuário.' };
     }
 });
 
-ipcMain.handle('editar-usuario', (event, dados) => {
+ipcMain.handle('editar-usuario', async (event, dados) => {
     try {
         const id = Number(dados?.id);
         const nome = String(dados?.nome || '').trim();
@@ -4207,103 +3799,107 @@ ipcMain.handle('editar-usuario', (event, dados) => {
 
         if (!id || !nome || !usuario) return { sucesso: false, mensagem: 'Preencha os dados obrigatórios.' };
         if (sessao && Number(sessao.id) === id && perfil !== 'administrador') return { sucesso: false, mensagem: 'O administrador não pode remover o próprio perfil administrativo.' };
-        const existente = db.prepare(`SELECT * FROM usuarios WHERE id = ?`).get(id);
-        if (!existente) return { sucesso: false, mensagem: 'Usuário não encontrado.' };
-        const duplicado = db.prepare(`SELECT id FROM usuarios WHERE lower(usuario) = lower(?) AND id <> ?`).get(usuario, id);
-        if (duplicado) return { sucesso: false, mensagem: 'Este nome de usuário já está em uso.' };
+        const resultado = await acessoBanco.transacao(async banco => {
+            const existente = await banco.consultarUm('SELECT * FROM usuarios WHERE id = ?', [id]);
+            if (!existente) throw new Error('Usuário não encontrado.');
+            const duplicado = await banco.consultarUm('SELECT id FROM usuarios WHERE lower(usuario) = lower(?) AND id <> ?', [usuario, id]);
+            if (duplicado) throw new Error('Este nome de usuário já está em uso.');
 
-        if (existente.perfil === 'administrador' && perfil !== 'administrador') {
-            const totalAdmins = db.prepare(`SELECT COUNT(*) AS total FROM usuarios WHERE perfil = 'administrador' AND ativo = 1`).get();
-            if (Number(totalAdmins.total) <= 1) return { sucesso: false, mensagem: 'O sistema precisa manter pelo menos um administrador ativo.' };
-        }
+            if (existente.perfil === 'administrador' && perfil !== 'administrador') {
+                const totalAdmins = await banco.consultarUm("SELECT COUNT(*) AS total FROM usuarios WHERE perfil = 'administrador' AND ativo = 1");
+                if (Number(totalAdmins.total) <= 1) throw new Error('O sistema precisa manter pelo menos um administrador ativo.');
+            }
 
-        db.prepare(`UPDATE usuarios SET nome = ?, usuario = ?, perfil = ?, atualizado_em = CURRENT_TIMESTAMP WHERE id = ?`).run(nome, usuario, perfil, id);
-        garantirPermissoesUsuario(id, perfil);
+            await banco.executar('UPDATE usuarios SET nome = ?, usuario = ?, perfil = ?, atualizado_em = CURRENT_TIMESTAMP WHERE id = ?', [nome, usuario, perfil, id]);
+            await garantirPermissoesNoEscopo(banco, id, perfil);
+        });
         return { sucesso: true };
     } catch (erro) {
+        if (['Usuário não encontrado.', 'Este nome de usuário já está em uso.', 'O sistema precisa manter pelo menos um administrador ativo.'].includes(erro.message)) {
+            return { sucesso: false, mensagem: erro.message };
+        }
         console.error('Erro ao editar usuário:', erro);
         return { sucesso: false, mensagem: erro.message || 'Não foi possível editar o usuário.' };
     }
 });
 
-ipcMain.handle('alterar-senha-usuario', (event, dados) => {
+ipcMain.handle('alterar-senha-usuario', async (event, dados) => {
     try {
         const id = Number(dados?.id);
         const senha = String(dados?.senha || '');
         if (!id || senha.length < 6) return { sucesso: false, mensagem: 'A senha deve possuir pelo menos 6 caracteres.' };
         const novo = gerarSenha(senha);
-        const resultado = db.prepare(`UPDATE usuarios SET senha_hash = ?, senha_salt = ?, primeiro_acesso = 0, atualizado_em = CURRENT_TIMESTAMP WHERE id = ?`).run(novo.hash, novo.salt, id);
+        const resultado = await acessoBanco.executar(`UPDATE usuarios SET senha_hash = ?, senha_salt = ?, primeiro_acesso = 0, atualizado_em = CURRENT_TIMESTAMP WHERE id = ?`, [novo.hash, novo.salt, id]);
         return { sucesso: resultado.changes === 1 };
     } catch (erro) {
         return { sucesso: false, mensagem: erro.message || 'Não foi possível alterar a senha.' };
     }
 });
 
-ipcMain.handle('alternar-status-usuario', (event, idInformado) => {
+ipcMain.handle('alternar-status-usuario', async (event, idInformado) => {
     try {
         const id = Number(idInformado);
         const sessao = sessoesGestor.get(event.sender.id);
         if (!id) return { sucesso: false, mensagem: 'Usuário inválido.' };
         if (sessao && Number(sessao.id) === id) return { sucesso: false, mensagem: 'Você não pode desativar o próprio usuário.' };
-        const usuario = db.prepare(`SELECT id, perfil, ativo FROM usuarios WHERE id = ?`).get(id);
+        const usuario = await acessoBanco.consultarUm(`SELECT id, perfil, ativo FROM usuarios WHERE id = ?`, [id]);
         if (!usuario) return { sucesso: false, mensagem: 'Usuário não encontrado.' };
         if (Number(usuario.ativo) === 1 && usuario.perfil === 'administrador') {
-            const totalAdmins = db.prepare(`SELECT COUNT(*) AS total FROM usuarios WHERE perfil = 'administrador' AND ativo = 1`).get();
+            const totalAdmins = await acessoBanco.consultarUm(`SELECT COUNT(*) AS total FROM usuarios WHERE perfil = 'administrador' AND ativo = 1`);
             if (Number(totalAdmins.total) <= 1) return { sucesso: false, mensagem: 'Não é possível desativar o último administrador ativo.' };
         }
         const novoStatus = Number(usuario.ativo) === 1 ? 0 : 1;
-        db.prepare(`UPDATE usuarios SET ativo = ?, atualizado_em = CURRENT_TIMESTAMP WHERE id = ?`).run(novoStatus, id);
+        await acessoBanco.executar(`UPDATE usuarios SET ativo = ?, atualizado_em = CURRENT_TIMESTAMP WHERE id = ?`, [novoStatus, id]);
         return { sucesso: true, ativo: novoStatus === 1 };
     } catch (erro) {
         return { sucesso: false, mensagem: erro.message || 'Não foi possível alterar o status.' };
     }
 });
 
-ipcMain.handle('buscar-permissoes-usuario', (event, idInformado) => {
+ipcMain.handle('buscar-permissoes-usuario', async (event, idInformado) => {
     const id = Number(idInformado);
-    const usuario = db.prepare(`SELECT id, perfil FROM usuarios WHERE id = ?`).get(id);
+    const usuario = await acessoBanco.consultarUm(`SELECT id, perfil FROM usuarios WHERE id = ?`, [id]);
     if (!usuario) return { sucesso: false, mensagem: 'Usuário não encontrado.' };
-    return { sucesso: true, perfil: usuario.perfil, permissoes: buscarPermissoesUsuario(usuario.id, usuario.perfil) };
+    return { sucesso: true, perfil: usuario.perfil, permissoes: await buscarPermissoesUsuario(usuario.id, usuario.perfil) };
 });
 
-ipcMain.handle('salvar-permissoes-usuario', (event, dados) => {
+ipcMain.handle('salvar-permissoes-usuario', async (event, dados) => {
     try {
         const usuarioId = Number(dados?.usuario_id);
-        const usuario = db.prepare(`SELECT id, perfil FROM usuarios WHERE id = ?`).get(usuarioId);
+        const usuario = await acessoBanco.consultarUm(`SELECT id, perfil FROM usuarios WHERE id = ?`, [usuarioId]);
         if (!usuario) return { sucesso: false, mensagem: 'Usuário não encontrado.' };
         if (usuario.perfil === 'administrador') return { sucesso: false, mensagem: 'Administradores possuem acesso total.' };
         const permissoes = Array.isArray(dados?.permissoes) ? dados.permissoes : [];
 
-        const salvar = db.transaction(() => {
+        await acessoBanco.transacao(async banco => {
             for (const modulo of MODULOS_PERMISSAO) {
                 const item = permissoes.find(p => p.modulo === modulo) || {};
-                db.prepare(`
-                    INSERT INTO permissoes_usuarios (usuario_id, modulo, consultar, criar, editar, excluir)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(usuario_id, modulo) DO UPDATE SET
-                        consultar = excluded.consultar,
-                        criar = excluded.criar,
-                        editar = excluded.editar,
-                        excluir = excluded.excluir,
-                        atualizado_em = CURRENT_TIMESTAMP
-                `).run(
-                    usuarioId,
-                    modulo,
+                const valores = [
                     item.consultar ? 1 : 0,
                     item.criar ? 1 : 0,
                     item.editar ? 1 : 0,
                     item.excluir ? 1 : 0
-                );
+                ];
+                const atualizada = await banco.executar(`
+                    UPDATE permissoes_usuarios
+                    SET consultar = ?, criar = ?, editar = ?, excluir = ?, atualizado_em = CURRENT_TIMESTAMP
+                    WHERE usuario_id = ? AND modulo = ?
+                `, [...valores, usuarioId, modulo]);
+                if (!atualizada.changes) {
+                    await banco.executar(`
+                        INSERT INTO permissoes_usuarios (usuario_id, modulo, consultar, criar, editar, excluir)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    `, [usuarioId, modulo, ...valores]);
+                }
             }
         });
-        salvar();
         return { sucesso: true };
     } catch (erro) {
         return { sucesso: false, mensagem: erro.message || 'Não foi possível salvar as permissões.' };
     }
 });
 
-ipcMain.handle('listar-auditoria', (event, filtros = {}) => {
+ipcMain.handle('listar-auditoria', async (event, filtros = {}) => {
     const sessao = sessoesGestor.get(event.sender.id);
     if (!sessao || sessao.perfil !== 'administrador') {
         return { sucesso: false, mensagem: 'Acesso restrito ao administrador.', registros: [] };
@@ -4315,7 +3911,7 @@ ipcMain.handle('listar-auditoria', (event, filtros = {}) => {
     if (termo) { sql += ` WHERE usuario_nome LIKE ? OR usuario_login LIKE ? OR descricao LIKE ? OR modulo LIKE ? OR acao LIKE ?`; const t=`%${termo}%`; params.push(t,t,t,t,t); }
     sql += ` ORDER BY id DESC LIMIT ?`; params.push(limite);
 
-    const registros = db.prepare(sql).all(...params);
+    const registros = await acessoBanco.consultar(sql, params);
 
     // Enriquece cada registro com uma referência humana ao objeto afetado.
     // Isso permite que a auditoria mostre, por exemplo, "Venda #000007 — João"
@@ -4333,13 +3929,13 @@ ipcMain.handle('listar-auditoria', (event, filtros = {}) => {
 
         try {
             if (idEntidade && tipo === 'venda') {
-                const item = db.prepare(`
+                const item = await acessoBanco.consultarUm(`
                     SELECT v.id, v.numero, v.total, v.forma_pagamento,
                            c.nome AS cliente_nome, c.cpf_cnpj AS cliente_cpf_cnpj
                     FROM vendas v
                     LEFT JOIN clientes c ON c.id = v.cliente_id
                     WHERE v.id = ?
-                `).get(idEntidade);
+                `, [idEntidade]);
                 if (item) {
                     registro.origem_numero = Number(item.numero);
                     registro.origem_nome = item.cliente_nome || null;
@@ -4352,13 +3948,13 @@ ipcMain.handle('listar-auditoria', (event, filtros = {}) => {
                     ].filter(Boolean).join(' • ');
                 }
             } else if (idEntidade && tipo === 'ordem_servico') {
-                const item = db.prepare(`
+                const item = await acessoBanco.consultarUm(`
                     SELECT o.id, o.numero, o.status, o.total, o.tipo_equipamento, o.marca, o.modelo,
                            c.nome AS cliente_nome, c.cpf_cnpj AS cliente_cpf_cnpj
                     FROM ordens_servico o
                     LEFT JOIN clientes c ON c.id = o.cliente_id
                     WHERE o.id = ?
-                `).get(idEntidade);
+                `, [idEntidade]);
                 if (item) {
                     registro.origem_numero = Number(item.numero);
                     registro.origem_nome = item.cliente_nome || null;
@@ -4373,7 +3969,7 @@ ipcMain.handle('listar-auditoria', (event, filtros = {}) => {
                     ].filter(Boolean).join(' • ');
                 }
             } else if (idEntidade && tipo === 'produto') {
-                const item = db.prepare(`SELECT id, nome, sku, codigo_barras, estoque FROM produtos WHERE id = ?`).get(idEntidade);
+                const item = await acessoBanco.consultarUm(`SELECT id, nome, sku, codigo_barras, estoque FROM produtos WHERE id = ?`, [idEntidade]);
                 if (item) {
                     registro.origem_nome = item.nome || null;
                     registro.origem_documento = item.sku || item.codigo_barras || null;
@@ -4385,7 +3981,7 @@ ipcMain.handle('listar-auditoria', (event, filtros = {}) => {
                     ].filter(Boolean).join(' • ');
                 }
             } else if (idEntidade && tipo === 'cliente') {
-                const item = db.prepare(`SELECT id, nome, cpf_cnpj, celular, email FROM clientes WHERE id = ?`).get(idEntidade);
+                const item = await acessoBanco.consultarUm(`SELECT id, nome, cpf_cnpj, celular, email FROM clientes WHERE id = ?`, [idEntidade]);
                 if (item) {
                     registro.origem_nome = item.nome || null;
                     registro.origem_documento = item.cpf_cnpj || null;
@@ -4397,7 +3993,7 @@ ipcMain.handle('listar-auditoria', (event, filtros = {}) => {
                     ].filter(Boolean).join(' • ');
                 }
             } else if (idEntidade && tipo === 'usuario') {
-                const item = db.prepare(`SELECT id, nome, usuario, perfil, ativo FROM usuarios WHERE id = ?`).get(idEntidade);
+                const item = await acessoBanco.consultarUm(`SELECT id, nome, usuario, perfil, ativo FROM usuarios WHERE id = ?`, [idEntidade]);
                 if (item) {
                     registro.origem_nome = item.nome || null;
                     registro.origem_documento = item.usuario || null;
@@ -4405,11 +4001,11 @@ ipcMain.handle('listar-auditoria', (event, filtros = {}) => {
                     registro.origem_detalhes = `Perfil: ${item.perfil === 'administrador' ? 'Administrador' : 'Funcionário'} • Status: ${Number(item.ativo) === 1 ? 'Ativo' : 'Inativo'}`;
                 }
             } else if (idEntidade && tipo === 'garantia') {
-                const item = db.prepare(`
+                const item = await acessoBanco.consultarUm(`
                     SELECT g.id, g.venda_id, g.os_id, g.status, c.nome AS cliente_nome
                     FROM garantias g LEFT JOIN clientes c ON c.id = g.cliente_id
                     WHERE g.id = ?
-                `).get(idEntidade);
+                `, [idEntidade]);
                 if (item) {
                     registro.origem_nome = item.cliente_nome || null;
                     registro.origem_descricao = `Garantia #${item.id}`;
@@ -4429,10 +4025,10 @@ ipcMain.handle('listar-auditoria', (event, filtros = {}) => {
     return { sucesso:true, registros };
 });
 
-ipcMain.handle('registrar-logout', (event) => {
+ipcMain.handle('registrar-logout', async (event) => {
     const sessao = sessoesGestor.get(event.sender.id);
     if (!sessao) return { sucesso: true };
-    registrarAuditoria(sessao, { acao:'logout', modulo:'seguranca', descricao:'Saiu do sistema.' });
+    await registrarAuditoria(sessao, { acao:'logout', modulo:'seguranca', descricao:'Saiu do sistema.' });
     sessoesGestor.delete(event.sender.id);
     return { sucesso:true };
 });
@@ -4443,26 +4039,31 @@ ipcMain.handle('registrar-logout', (event) => {
     ==================================================
 */
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+    try {
+        const runtime = await inicializarProvedorBanco();
+        if (runtime.tipo === 'sqlite' || runtime.tipo === 'firebird') iniciarBackupAutomatico();
 
-    criarJanela();
-
-
-    app.on(
-        'activate',
-        () => {
-
-            if (
-                BrowserWindow.getAllWindows().length === 0
-            ) {
-
-                criarJanela();
-
-            }
-
+        const anuncio = configuracaoFirebird.lerConfiguracaoAnuncio(app.getPath('userData'));
+        if (runtime.tipo === 'firebird' && anuncio?.id && anuncio?.alias) {
+            anunciadorFirebird = descobertaFirebird.criarAnunciador(anuncio);
+            await anunciadorFirebird.iniciar();
+            console.info('Anúncio de descoberta Firebird local ativado.');
         }
-    );
+        criarJanela();
+    } catch (erro) {
+        console.error('Falha ao inicializar o banco de dados configurado:', erro);
+        dialog.showErrorBox(
+            'Não foi possível abrir o banco do Gestor Fácil',
+            `A configuração Firebird existe, mas a conexão, a validação do esquema ou a importação inicial falhou. O SQLite local não será usado como substituto.\n\nDetalhes: ${String(erro.message || erro)}`
+        );
+        app.quit();
+        return;
+    }
 
+    app.on('activate', () => {
+        if (BrowserWindow.getAllWindows().length === 0) criarJanela();
+    });
 });
 
 

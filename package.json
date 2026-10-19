@@ -1,14 +1,19 @@
 {
   "name": "gestor-facil",
-  "version": "1.0.2",
+  "version": "1.0.28",
   "description": "Sistema de gestão para pequenos negócios",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder --win nsis --config electron-builder.config.cjs --publish never",
+    "dist": "npm run preparar:firebird && electron-builder --win nsis --config electron-builder.config.cjs --publish never",
     "publish:github": "npm run dist",
+    "preparar:firebird": "node tools/obter-firebird-servidor.cjs",
+    "criar:esquema-firebird": "node tools/criar-esquema-firebird.cjs",
+    "diagnosticar:firebird": "node tools/diagnosticar-firebird.cjs",
+    "migrar:firebird": "node tools/migrar-sqlite-para-firebird.cjs",
     "dist:licenciador": "electron-builder --projectDir tools/licenca/app --win portable",
     "licenca:preparar": "node tools/licenca/preparar-chaves.cjs",
+    "licenca:preparar:v2": "node tools/licenca/preparar-chaves-v2.cjs",
     "licenca:gerar": "node tools/licenca/gerar-licenca.cjs"
   },
   "devDependencies": {
@@ -17,7 +22,8 @@
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",
-    "electron-updater": "^6.8.9"
+    "electron-updater": "^6.8.9",
+    "node-firebird": "^2.18.2"
   },
   "build": {
     "appId": "br.com.gestorfacil.app",
@@ -30,8 +36,10 @@
       "preload.js",
       "licenciamento.js",
       "src/**/*",
+      "tools/migrar-sqlite-para-firebird.cjs",
       "database/**/*.js",
       "licenses/license-public.pem",
+      "licenses/license-public-v2.pem",
       "package.json",
       "!**/*.bak*",
       "!**/*.rar",
@@ -40,11 +48,31 @@
     "asarUnpack": [
       "node_modules/better-sqlite3/**/*"
     ],
+    "extraResources": [
+      {
+        "from": "build/firebird/Firebird-5.0.4.1812-0-windows-x64.exe",
+        "to": "firebird/servidor-setup.exe"
+      },
+      {
+        "from": "database/firebird/schema.sql",
+        "to": "firebird/schema.sql"
+      },
+      {
+        "from": "tools/instalar-firebird-servidor.ps1",
+        "to": "firebird/instalar-servidor.ps1"
+      },
+      {
+        "from": "tools/ler-configuracao-firebird.ps1",
+        "to": "firebird/ler-configuracao.ps1"
+      }
+    ],
     "win": {
       "target": "nsis"
     },
     "nsis": {
       "oneClick": false,
+      "include": "build/installer.nsh",
+      "perMachine": true,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
