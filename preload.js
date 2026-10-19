@@ -5,12 +5,14 @@
  * a ipcRenderer, ao sistema de arquivos ou ao banco de dados.
  */
 const { contextBridge, ipcRenderer } = require('electron');
+const versaoArgumento = process.argv.find(argumento => argumento.startsWith('--gestor-facil-version=')) || '';
+const versaoAplicativo = versaoArgumento.slice('--gestor-facil-version='.length);
 
 
 // API pública mínima consumida por src/renderer.js.
 contextBridge.exposeInMainWorld('api', {
 
-    obterVersaoAplicativo: () => ipcRenderer.invoke('obter-versao-aplicativo'),
+    versaoAplicativo,
 
     obterEstadoLicenca: () => ipcRenderer.invoke('obter-estado-licenca'),
 

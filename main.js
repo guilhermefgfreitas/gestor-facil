@@ -485,7 +485,7 @@ function mapaAuditoriaCanal(canal, dados, resultado, sessao, snapshotAntes = nul
 const ipcHandleOriginal = ipcMain.handle.bind(ipcMain);
 ipcMain.handle = (canal, listener) => {
     return ipcHandleOriginal(canal, async (event, ...args) => {
-        if (['obter-estado-licenca', 'ativar-licenca', 'obter-versao-aplicativo'].includes(canal)) {
+        if (['obter-estado-licenca', 'ativar-licenca'].includes(canal)) {
             return listener(event, ...args);
         }
 
@@ -597,7 +597,6 @@ app.on('browser-window-created', (_event, janela) => {
 
 
 ipcMain.handle('obter-estado-licenca', () => licenciamento.obterEstadoLicenca());
-ipcMain.handle('obter-versao-aplicativo', () => app.getVersion());
 
 ipcMain.handle('obter-estado-inicializacao', async () => {
     try {
@@ -1521,7 +1520,8 @@ function criarJanela() {
             ),
 
             contextIsolation: true,
-            nodeIntegration: false
+            nodeIntegration: false,
+            additionalArguments: [`--gestor-facil-version=${app.getVersion()}`]
 
         }
 
