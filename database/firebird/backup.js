@@ -3,6 +3,14 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const Firebird = require('node-firebird');
 
+function pastaServicoBackup() {
+    return path.join(process.env.ProgramData || 'C:\\ProgramData', 'GestorFacil', 'Backups');
+}
+
+function nomeTemporarioServico(extensao) {
+    return path.join(pastaServicoBackup(), `.gf-${crypto.randomUUID()}.${extensao}`);
+}
+
 function criarGerenciador(config) {
     const host = String(config?.host || '').trim();
     const database = String(config?.database || '').trim();
@@ -35,27 +43,32 @@ function executarOperacao(servico, metodo, opcoes) {
         servico[metodo](opcoes, (erro, fluxo) => {
             if (erro) return reject(erro);
             if (!fluxo || typeof fluxo.on !== 'function') return reject(new Error('O serviço Firebird não retornou o resultado da operação.'));
-            fluxo.on('data', () => {});
+            const mensagens = [];
+            fluxo.on('data', linha => mensagens.push(Buffer.isBuffer(linha) ? linha.toString('utf8') : String(linha)));
             fluxo.once('error', reject);
-            fluxo.once('end', resolve);
+            fluxo.once('end', () => resolve(mensagens.join('\n').trim()));
         });
     });
 }
 
-function caminhoBancoTemporario(caminhoBackup) {
-    return path.join(path.dirname(caminhoBackup), `.gf-validacao-${crypto.randomUUID()}.fdb`);
+function caminhoBancoTemporario() {
+    return nomeTemporarioServico('fdb');
 }
 
 async function restaurarParaValidacao(servico, caminhoBackup) {
-    const temporario = caminhoBancoTemporario(caminhoBackup);
+    const temporario = caminhoBancoTemporario();
     try {
-        await executarOperacao(servico, 'restore', {
+        const saida = await executarOperacao(servico, 'restore', {
             database: temporario,
             files: [caminhoBackup],
             create: true,
             verbose: true
         });
-        const info = await fs.promises.stat(temporario);
+        let info;
+        try { info = await fs.promises.stat(temporario); }
+        catch (_) {
+            throw new Error(`O Firebird não criou a base temporária de validação.${saida ? ` Detalhes: ${saida}` : ''}`);
+        }
         if (!info.isFile() || info.size < 4096) throw new Error('A validação não produziu uma base Firebird utilizável.');
     } finally {
         try { await fs.promises.rm(temporario, { force: true }); } catch (_) {}
@@ -63,50 +76,65 @@ async function restaurarParaValidacao(servico, caminhoBackup) {
 }
 
 async function criarBackupFirebird(config, destino, { validar = true } = {}) {
+    const arquivoTemporario = nomeTemporarioServico('fbk');
+    const arquivoDestinoTemporario = `${destino}.${crypto.randomUUID()}.tmp`;
     const servico = await criarGerenciador(config);
     try {
-        await fs.promises.mkdir(path.dirname(destino), { recursive: true });
+        await fs.promises.mkdir(pastaServicoBackup(), { recursive: true });
         await executarOperacao(servico, 'backup', {
             database: config.database,
-            files: [{ filename: destino, sizefile: '0' }],
+            files: [{ filename: arquivoTemporario, sizefile: '0' }],
             verbose: true
         });
-        const info = await fs.promises.stat(destino);
+        const info = await fs.promises.stat(arquivoTemporario);
         if (!info.isFile() || info.size < 1024) throw new Error('O Firebird terminou sem criar um arquivo de backup válido.');
-        if (validar) await restaurarParaValidacao(servico, destino);
+        if (validar) await restaurarParaValidacao(servico, arquivoTemporario);
+        await fs.promises.mkdir(path.dirname(destino), { recursive: true });
+        await fs.promises.copyFile(arquivoTemporario, arquivoDestinoTemporario);
+        await fs.promises.rename(arquivoDestinoTemporario, destino);
         return { caminho: destino, bytes: info.size };
-    } catch (erro) {
-        // Cópias cujo processo falhou ou que não passaram na restauração não
-        // podem permanecer com aparência de backup válido.
-        try { await fs.promises.rm(destino, { force: true }); } catch (_) {}
-        throw erro;
     } finally {
-        await servico.detachAsync();
+        try { await servico.detachAsync(); }
+        finally {
+            try { await fs.promises.rm(arquivoTemporario, { force: true }); } catch (_) {}
+            try { await fs.promises.rm(arquivoDestinoTemporario, { force: true }); } catch (_) {}
+        }
     }
 }
 
 async function validarBackupFirebird(config, caminhoBackup) {
     const info = await fs.promises.stat(caminhoBackup);
     if (!info.isFile() || info.size < 1024) throw new Error('O arquivo selecionado está vazio ou incompleto.');
+    await fs.promises.mkdir(pastaServicoBackup(), { recursive: true });
+    const arquivoTemporario = nomeTemporarioServico('fbk');
     const servico = await criarGerenciador(config);
-    try { await restaurarParaValidacao(servico, caminhoBackup); }
-    finally { await servico.detachAsync(); }
+    try {
+        await fs.promises.copyFile(caminhoBackup, arquivoTemporario);
+        await restaurarParaValidacao(servico, arquivoTemporario);
+    } finally {
+        try { await servico.detachAsync(); }
+        finally { try { await fs.promises.rm(arquivoTemporario, { force: true }); } catch (_) {} }
+    }
     return true;
 }
 
 async function restaurarBackupFirebird(config, caminhoBackup, { substituir = false } = {}) {
+    await fs.promises.mkdir(pastaServicoBackup(), { recursive: true });
+    const arquivoTemporario = nomeTemporarioServico('fbk');
     const servico = await criarGerenciador(config);
     try {
-        await restaurarParaValidacao(servico, caminhoBackup);
+        await fs.promises.copyFile(caminhoBackup, arquivoTemporario);
+        await restaurarParaValidacao(servico, arquivoTemporario);
         await executarOperacao(servico, 'restore', {
             database: config.database,
-            files: [caminhoBackup],
+            files: [arquivoTemporario],
             replace: substituir,
             create: !substituir,
             verbose: true
         });
     } finally {
-        await servico.detachAsync();
+        try { await servico.detachAsync(); }
+        finally { try { await fs.promises.rm(arquivoTemporario, { force: true }); } catch (_) {} }
     }
 }
 
