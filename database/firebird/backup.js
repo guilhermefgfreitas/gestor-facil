@@ -46,36 +46,16 @@ function executarOperacao(servico, metodo, opcoes) {
             const mensagens = [];
             fluxo.on('data', linha => mensagens.push(Buffer.isBuffer(linha) ? linha.toString('utf8') : String(linha)));
             fluxo.once('error', reject);
-            fluxo.once('end', () => resolve(mensagens.join('\n').trim()));
+            fluxo.once('end', () => {
+                const saida = mensagens.join('\n').trim();
+                if (/^(?:gbak:\s*)?ERROR\b|^Error:\s/im.test(saida)) return reject(new Error(saida));
+                resolve(saida);
+            });
         });
     });
 }
 
-function caminhoBancoTemporario() {
-    return nomeTemporarioServico('fdb');
-}
-
-async function restaurarParaValidacao(servico, caminhoBackup) {
-    const temporario = caminhoBancoTemporario();
-    try {
-        const saida = await executarOperacao(servico, 'restore', {
-            database: temporario,
-            files: [caminhoBackup],
-            create: true,
-            verbose: true
-        });
-        let info;
-        try { info = await fs.promises.stat(temporario); }
-        catch (_) {
-            throw new Error(`O Firebird não criou a base temporária de validação.${saida ? ` Detalhes: ${saida}` : ''}`);
-        }
-        if (!info.isFile() || info.size < 4096) throw new Error('A validação não produziu uma base Firebird utilizável.');
-    } finally {
-        try { await fs.promises.rm(temporario, { force: true }); } catch (_) {}
-    }
-}
-
-async function criarBackupFirebird(config, destino, { validar = true } = {}) {
+async function criarBackupFirebird(config, destino) {
     const arquivoTemporario = nomeTemporarioServico('fbk');
     const arquivoDestinoTemporario = `${destino}.${crypto.randomUUID()}.tmp`;
     const servico = await criarGerenciador(config);
@@ -88,7 +68,6 @@ async function criarBackupFirebird(config, destino, { validar = true } = {}) {
         });
         const info = await fs.promises.stat(arquivoTemporario);
         if (!info.isFile() || info.size < 1024) throw new Error('O Firebird terminou sem criar um arquivo de backup válido.');
-        if (validar) await restaurarParaValidacao(servico, arquivoTemporario);
         await fs.promises.mkdir(path.dirname(destino), { recursive: true });
         await fs.promises.copyFile(arquivoTemporario, arquivoDestinoTemporario);
         await fs.promises.rename(arquivoDestinoTemporario, destino);
@@ -102,29 +81,19 @@ async function criarBackupFirebird(config, destino, { validar = true } = {}) {
     }
 }
 
-async function validarBackupFirebird(config, caminhoBackup) {
+async function validarBackupFirebird(caminhoBackup) {
     const info = await fs.promises.stat(caminhoBackup);
     if (!info.isFile() || info.size < 1024) throw new Error('O arquivo selecionado está vazio ou incompleto.');
-    await fs.promises.mkdir(pastaServicoBackup(), { recursive: true });
-    const arquivoTemporario = nomeTemporarioServico('fbk');
-    const servico = await criarGerenciador(config);
-    try {
-        await fs.promises.copyFile(caminhoBackup, arquivoTemporario);
-        await restaurarParaValidacao(servico, arquivoTemporario);
-    } finally {
-        try { await servico.detachAsync(); }
-        finally { try { await fs.promises.rm(arquivoTemporario, { force: true }); } catch (_) {} }
-    }
     return true;
 }
 
 async function restaurarBackupFirebird(config, caminhoBackup, { substituir = false } = {}) {
+    await validarBackupFirebird(caminhoBackup);
     await fs.promises.mkdir(pastaServicoBackup(), { recursive: true });
     const arquivoTemporario = nomeTemporarioServico('fbk');
     const servico = await criarGerenciador(config);
     try {
         await fs.promises.copyFile(caminhoBackup, arquivoTemporario);
-        await restaurarParaValidacao(servico, arquivoTemporario);
         await executarOperacao(servico, 'restore', {
             database: config.database,
             files: [arquivoTemporario],

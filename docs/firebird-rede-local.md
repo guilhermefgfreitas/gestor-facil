@@ -21,8 +21,8 @@ O broadcast de descoberta informa apenas identificador, nome/alias e portas. O c
 ## Backup e restauração
 
 - Configure backup manual ou automático em **Auditoria > Backup e segurança** no servidor. As estações não executam operações de backup.
-- Os arquivos são backups Firebird `.fbk`, armazenados no computador servidor. A pasta padrão fica em `C:\ProgramData\GestorFacil\Backups`; uma pasta escolhida precisa permitir gravação ao serviço Firebird e ao usuário do Gestor Fácil.
-- O backup só informa sucesso depois de restaurar a cópia em uma base temporária e conferir que ela foi criada.
+- Os arquivos são backups Firebird `.fbk`, armazenados no computador servidor. O Firebird cria o arquivo em `C:\ProgramData\GestorFacil\Backups`, onde o serviço tem acesso, e o Gestor Fácil copia o resultado para a pasta de destino escolhida.
+- O backup só informa sucesso quando a operação do Firebird termina sem erro e o arquivo foi criado com conteúdo. A conferência por restauração é feita quando o arquivo é restaurado; ela não é usada durante cada backup porque exigiria conceder ao usuário de backup permissão global para criar bancos.
 - O agendamento é executado enquanto o programa está aberto no servidor. Se o servidor for desligado, o horário perdido será tentado na próxima abertura.
 - Antes da restauração, feche o programa em todas as estações. O servidor valida o arquivo, grava uma cópia de segurança da base atual e só então substitui a base e reinicia o Gestor Fácil.
 

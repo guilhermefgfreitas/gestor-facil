@@ -1092,7 +1092,7 @@ async function executarBackupAutomatico(chaveAgendamento) {
 
         fs.mkdirSync(config.pasta, { recursive: true });
         const destino = path.join(config.pasta, nomeBackupAutomatico());
-        if (tipoBancoAtivo === 'firebird') await criarBackupFirebird(configuracaoFirebirdRuntime, destino, { validar: true });
+        if (tipoBancoAtivo === 'firebird') await criarBackupFirebird(configuracaoFirebirdRuntime, destino);
         else {
             await db.backup(destino);
             try { validarArquivoBackup(destino, true); }
@@ -1113,14 +1113,14 @@ async function executarBackupAutomatico(chaveAgendamento) {
                 ultimoErroBackupDataHora: ''
             });
         } catch (erroConfig) {
-            console.error('O backup foi criado e validado, mas não foi possível atualizar o registro do agendamento:', erroConfig);
+            console.error('O backup foi criado, mas não foi possível atualizar o registro do agendamento:', erroConfig);
         }
 
         // Falhas na retenção não invalidam o backup recém-criado e conferido.
         try {
             limparBackupsAntigos(config.pasta, 'gestor-facil-auto-', config.manter, tipoBancoAtivo === 'firebird' ? '.fbk' : '.db');
         } catch (erroRetencao) {
-            console.error('Backup criado e validado, mas não foi possível aplicar a retenção:', erroRetencao);
+            console.error('Backup criado, mas não foi possível aplicar a retenção:', erroRetencao);
         }
 
         await registrarAuditoria(null, {
@@ -1210,10 +1210,10 @@ async function executarBackupAutomaticoForcado() {
         if (!config.pasta) return { sucesso: false, mensagem: 'Configure primeiro a pasta de destino.' };
         fs.mkdirSync(config.pasta, { recursive: true });
         const destino = path.join(config.pasta, nomeBackupAutomatico().replace('gestor-facil-auto-', 'gestor-facil-teste-'));
-        if (tipoBancoAtivo === 'firebird') await criarBackupFirebird(configuracaoFirebirdRuntime, destino, { validar: true });
+        if (tipoBancoAtivo === 'firebird') await criarBackupFirebird(configuracaoFirebirdRuntime, destino);
         else { await db.backup(destino); validarArquivoBackup(destino, true); }
         try { limparBackupsAntigos(config.pasta, 'gestor-facil-teste-', 1, tipoBancoAtivo === 'firebird' ? '.fbk' : '.db'); }
-        catch (erroRetencao) { console.error('Backup de teste validado, mas não foi possível remover testes antigos:', erroRetencao); }
+        catch (erroRetencao) { console.error('Backup de teste criado, mas não foi possível remover testes antigos:', erroRetencao); }
         return { sucesso: true, caminho: destino, nome_arquivo: path.basename(destino) };
     } catch (erro) {
         console.error('Erro no teste do backup automático:', erro);
@@ -1346,7 +1346,7 @@ ipcMain.handle('fazer-backup', async (event) => {
         let destino = escolha.filePath;
         if (!destino.toLowerCase().endsWith(`.${extensao}`)) destino += `.${extensao}`;
 
-        if (tipoBancoAtivo === 'firebird') await criarBackupFirebird(configuracaoFirebirdRuntime, destino, { validar: true });
+        if (tipoBancoAtivo === 'firebird') await criarBackupFirebird(configuracaoFirebirdRuntime, destino);
         else { await db.backup(destino); validarArquivoBackup(destino, true); }
 
         return {
@@ -1359,7 +1359,7 @@ ipcMain.handle('fazer-backup', async (event) => {
         return {
             sucesso: false,
             mensagem: tipoBancoAtivo === 'firebird'
-                ? `Não foi possível criar e validar o backup Firebird: ${String(erro.message || erro)}`
+                ? `Não foi possível criar o backup Firebird: ${String(erro.message || erro)}`
                 : 'Não foi possível realizar o backup do banco de dados.'
         };
     } finally {
@@ -1392,7 +1392,7 @@ ipcMain.handle('restaurar-backup', async (event) => {
             });
             if (escolha.canceled || !escolha.filePaths?.[0]) return { sucesso: false, cancelado: true };
             const origem = path.resolve(escolha.filePaths[0]);
-            await validarBackupFirebird(configuracaoFirebirdRuntime, origem);
+            await validarBackupFirebird(origem);
 
             const configBackup = lerConfiguracaoBackup();
             const pastaSeguranca = configBackup.pasta || path.join(app.getPath('documents'), 'Gestor Fácil', 'Backups');
@@ -1401,7 +1401,7 @@ ipcMain.handle('restaurar-backup', async (event) => {
             const pad = n => String(n).padStart(2, '0');
             const nomeSeguranca = `gestor-facil-pre-restauracao-${agora.getFullYear()}-${pad(agora.getMonth()+1)}-${pad(agora.getDate())}_${pad(agora.getHours())}-${pad(agora.getMinutes())}-${pad(agora.getSeconds())}.fbk`;
             const backupSeguranca = path.join(pastaSeguranca, nomeSeguranca);
-            await criarBackupFirebird(configuracaoFirebirdRuntime, backupSeguranca, { validar: true });
+            await criarBackupFirebird(configuracaoFirebirdRuntime, backupSeguranca);
 
             const bancoAnterior = bancoFirebirdRuntime;
             try { await bancoAnterior?.fechar(); } catch (_) {}
