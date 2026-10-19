@@ -485,7 +485,7 @@ function mapaAuditoriaCanal(canal, dados, resultado, sessao, snapshotAntes = nul
 const ipcHandleOriginal = ipcMain.handle.bind(ipcMain);
 ipcMain.handle = (canal, listener) => {
     return ipcHandleOriginal(canal, async (event, ...args) => {
-        if (['obter-estado-licenca', 'ativar-licenca'].includes(canal)) {
+        if (['obter-estado-licenca', 'ativar-licenca', 'obter-versao-aplicativo'].includes(canal)) {
             return listener(event, ...args);
         }
 

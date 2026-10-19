@@ -8,7 +8,10 @@ const conteudo = document.getElementById('conteudo');
 
 window.api.obterVersaoAplicativo().then(versao => {
     const rodapeVersao = document.getElementById('versao-aplicativo');
-    if (rodapeVersao && versao) rodapeVersao.textContent = `Versão ${versao}`;
+    const versaoTexto = typeof versao === 'string'
+        ? versao
+        : (versao?.versao || versao?.version || versao?.appVersion || '');
+    if (rodapeVersao && versaoTexto) rodapeVersao.textContent = `Versão ${versaoTexto}`;
 }).catch(erro => console.warn('Não foi possível carregar a versão do aplicativo:', erro));
 
 const menuInicio = document.getElementById('menu-inicio');
