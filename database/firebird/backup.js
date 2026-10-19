@@ -4,14 +4,22 @@ const crypto = require('node:crypto');
 const Firebird = require('node-firebird');
 
 function criarGerenciador(config) {
+    const host = String(config?.host || '').trim();
+    const database = String(config?.database || '').trim();
     const user = String(config.backupUser || '').trim();
     const password = String(config.backupPassword || '');
+    if (!host || !database) {
+        throw new Error('O servidor e o alias do banco Firebird não estão configurados para o backup.');
+    }
     if (!user || !password) {
         throw new Error('A conta protegida de backup Firebird não está configurada. Reinstale/repare o serviço Firebird do Gestor Fácil no servidor.');
     }
     return Firebird.attachAsync({
-        host: config.host,
+        host,
         port: Number(config.port || 3050),
+        // node-firebird precisa do banco de destino no handshake mesmo para
+        // depois abrir a conexão ao Services Manager (manager: true).
+        database,
         user,
         password,
         role: 'RDB$ADMIN',
